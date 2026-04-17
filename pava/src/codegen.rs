@@ -56,8 +56,13 @@ enum ConstantPoolEntry {
 }
 
 const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PRIVATE: u16 = 0x0002;
+const ACC_PROTECTED: u16 = 0x0004;
 const ACC_STATIC: u16 = 0x0008;
+const ACC_FINAL: u16 = 0x0010;
 const ACC_SUPER: u16 = 0x0020;
+const ACC_ABSTRACT: u16 = 0x0400;
+const ACC_ENUM: u16 = 0x4000;
 
 impl CodeGen {
     pub fn new(_class: Class) -> Self {
@@ -91,6 +96,15 @@ impl CodeGen {
     pub fn generate(&mut self, class: Class) -> CompileResult<Vec<u8>> {
         self.class_name = class.name.clone();
         self.parent_class_name = class.extends.clone();
+
+        if class.is_enum {
+            self.parent_class_name = Some("java/lang/Enum".to_string());
+        }
+
+        if let Some(ref parent) = class.extends {
+            if !class.is_enum && parent != "java/lang/Object" {}
+        }
+
         self.collect_constants_from_class(&class);
         self.init_constant_pool(&class);
         self.emit_class(&class)
@@ -200,8 +214,10 @@ impl CodeGen {
         let class_class = add(ConstantPoolEntry::Class(class_utf8));
         self.class_idx = class_class;
 
-        // Handle extends - add parent class to constant pool
-        let super_class_idx = if let Some(ref parent) = class.extends {
+        let super_class_idx = if class.is_enum {
+            let enum_utf8 = add(ConstantPoolEntry::Utf8("java/lang/Enum".to_string()));
+            add(ConstantPoolEntry::Class(enum_utf8))
+        } else if let Some(ref parent) = class.extends {
             let parent_utf8 = add(ConstantPoolEntry::Utf8(parent.clone()));
             add(ConstantPoolEntry::Class(parent_utf8))
         } else {
@@ -291,39 +307,69 @@ impl CodeGen {
         }
 
         let access_flags = if class.is_interface {
-            0x0201
+            0x0201 | ACC_ABSTRACT
+        } else if class.is_enum {
+            ACC_PUBLIC | ACC_FINAL | ACC_SUPER | ACC_ENUM
         } else {
             ACC_SUPER
-        } | if class.is_abstract { 0x0400 } else { 0 }
-            | if class.is_final { 0x0010 } else { 0 };
+                | ACC_PUBLIC
+                | if class.is_abstract { ACC_ABSTRACT } else { 0 }
+                | if class.is_final { ACC_FINAL } else { 0 }
+        };
         bytes.extend_from_slice(&access_flags.to_be_bytes());
 
         bytes.extend_from_slice(&self.class_idx.to_be_bytes());
         bytes.extend_from_slice(&self.super_class_idx.to_be_bytes());
 
-        // Interfaces count
         bytes.extend_from_slice(&0u16.to_be_bytes());
 
-        // Fields count - include constants as static final fields
-        let fields_count = class.fields.len() as u16 + class.constants.len() as u16;
+        let promoted_fields_count = if let Some(ref ctor) = class.constructor {
+            ctor.promoted_params.len() as u16
+        } else {
+            0
+        };
+        let enum_fields_count = if class.is_enum {
+            class.enum_values.len() as u16
+        } else {
+            0
+        };
+        let fields_count = class.fields.len() as u16
+            + class.constants.len() as u16
+            + enum_fields_count
+            + promoted_fields_count;
         bytes.extend_from_slice(&fields_count.to_be_bytes());
 
-        // Emit constants as static final fields
         for const_decl in &class.constants {
             self.emit_const_field(&mut bytes, const_decl);
         }
 
-        // Emit regular fields
+        if class.is_enum {
+            for enum_val in &class.enum_values {
+                self.emit_enum_field(&mut bytes, &class.name, enum_val);
+            }
+        }
+
         for field in &class.fields {
             self.emit_field(&mut bytes, field);
         }
 
-        // Methods count - include <init> and potentially <clinit>
-        let has_clinit = !class.constants.is_empty();
+        if let Some(ref ctor) = class.constructor {
+            for promoted in &ctor.promoted_params {
+                self.emit_promoted_field(&mut bytes, promoted);
+            }
+        }
+
+        let has_clinit = !class.constants.is_empty() || class.is_enum;
         let method_count = class.methods.len() as u16 + 1 + if has_clinit { 1 } else { 0 };
         bytes.extend_from_slice(&method_count.to_be_bytes());
 
-        self.emit_init_method(&mut bytes);
+        if class.is_enum {
+            self.emit_enum_init_method(&mut bytes, class)?;
+        } else if class.constructor.is_some() {
+            self.emit_constructor_method(&mut bytes, class)?;
+        } else {
+            self.emit_init_method(&mut bytes);
+        }
 
         if has_clinit {
             self.emit_clinit_method(&mut bytes, class)?;
@@ -332,6 +378,8 @@ impl CodeGen {
         for method in &class.methods {
             if method.name == "main" {
                 self.emit_main_method(&mut bytes, class)?;
+            } else if method.is_abstract {
+                self.emit_abstract_method(&mut bytes, method)?;
             } else {
                 self.emit_method(&mut bytes, method)?;
             }
@@ -359,16 +407,50 @@ impl CodeGen {
 
     fn emit_field(&mut self, bytes: &mut Vec<u8>, field: &ClassField) {
         let access_flags = if field.is_public { ACC_PUBLIC } else { 0 }
-            | if field.is_private { 0x0002 } else { 0 }
-            | if field.is_protected { 0x0004 } else { 0 }
+            | if field.is_private { ACC_PRIVATE } else { 0 }
+            | if field.is_protected { ACC_PROTECTED } else { 0 }
             | if field.is_static { ACC_STATIC } else { 0 }
-            | if field.is_final { 0x0010 } else { 0 };
+            | if field.is_final { ACC_FINAL } else { 0 };
         bytes.extend_from_slice(&access_flags.to_be_bytes());
 
         let name_idx = self.add_utf8_constant(&field.name);
         bytes.extend_from_slice(&name_idx.to_be_bytes());
 
         let descriptor = field.field_type.to_jvm_descriptor();
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_enum_field(&mut self, bytes: &mut Vec<u8>, class_name: &str, enum_val: &EnumValue) {
+        let access_flags = ACC_PUBLIC | ACC_STATIC | ACC_FINAL;
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&enum_val.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = format!("L{};", class_name);
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_promoted_field(&mut self, bytes: &mut Vec<u8>, promoted: &PromotedParam) {
+        let access_flags = if promoted.is_public { ACC_PUBLIC } else { 0 }
+            | if promoted.is_private { ACC_PRIVATE } else { 0 }
+            | if promoted.is_protected {
+                ACC_PROTECTED
+            } else {
+                0
+            };
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&promoted.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = promoted.param_type.to_jvm_descriptor();
         let desc_idx = self.add_utf8_constant(&descriptor);
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
 
@@ -393,7 +475,13 @@ impl CodeGen {
             self.emit_const_assignment(const_decl)?;
         }
 
-        self.code_buffer.push(0xB1); // return
+        if class.is_enum {
+            for (i, enum_val) in class.enum_values.iter().enumerate() {
+                self.emit_enum_value_init(class, enum_val, i)?;
+            }
+        }
+
+        self.code_buffer.push(0xB1);
 
         let code_attr_len = 12 + self.code_buffer.len() as u32;
         bytes.extend_from_slice(&code_idx.to_be_bytes());
@@ -409,6 +497,52 @@ impl CodeGen {
         bytes.extend_from_slice(&0u16.to_be_bytes());
 
         Ok(())
+    }
+
+    fn emit_enum_value_init(
+        &mut self,
+        class: &Class,
+        enum_val: &EnumValue,
+        _ordinal: usize,
+    ) -> CompileResult<()> {
+        let class_name = &class.name;
+        let class_idx = self.add_class_constant(class_name);
+
+        self.code_buffer.push(0xBB);
+        self.code_buffer.extend_from_slice(&class_idx.to_be_bytes());
+        self.code_buffer.push(0x59);
+
+        let name_utf8_idx = self.add_utf8_constant(&enum_val.name);
+        let string_idx = self.add_string_constant(name_utf8_idx);
+        self.emit_ldc(string_idx);
+
+        self.emit_integer(enum_val.value)?;
+
+        let enum_init_idx =
+            self.add_methodref_constant(class_name, "<init>", "(Ljava/lang/String;I)V");
+        self.code_buffer.push(0xB7);
+        self.code_buffer
+            .extend_from_slice(&enum_init_idx.to_be_bytes());
+
+        let field_descriptor = format!("L{};", class_name);
+        let field_idx = self.add_fieldref_constant(class_name, &enum_val.name, &field_descriptor);
+        self.code_buffer.push(0xB3);
+        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn add_string_constant(&mut self, utf8_idx: u16) -> u16 {
+        for (i, entry) in self.constant_pool.iter().enumerate() {
+            if let ConstantPoolEntry::String(idx) = entry {
+                if *idx == utf8_idx {
+                    return (i + 1) as u16;
+                }
+            }
+        }
+        let idx = self.constant_pool.len() as u16 + 1;
+        self.constant_pool.push(ConstantPoolEntry::String(utf8_idx));
+        idx
     }
 
     fn emit_const_assignment(&mut self, const_decl: &ClassConst) -> CompileResult<()> {
@@ -438,7 +572,8 @@ impl CodeGen {
 
     fn emit_method(&mut self, bytes: &mut Vec<u8>, method: &ClassMethod) -> CompileResult<()> {
         let access_flags = if method.is_public { ACC_PUBLIC } else { 0 }
-            | if method.is_static { ACC_STATIC } else { 0 };
+            | if method.is_static { ACC_STATIC } else { 0 }
+            | if method.is_abstract { ACC_ABSTRACT } else { 0 };
 
         bytes.extend_from_slice(&access_flags.to_be_bytes());
 
@@ -448,6 +583,11 @@ impl CodeGen {
         let descriptor = self.build_method_descriptor(method);
         let desc_idx = self.add_utf8_constant(&descriptor);
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        if method.is_abstract {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            return Ok(());
+        }
 
         bytes.extend_from_slice(&1u16.to_be_bytes());
 
@@ -614,6 +754,138 @@ impl CodeGen {
 
         bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_constructor_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
+        let ctor = class.constructor.as_ref().unwrap();
+        let init_idx = self.add_utf8_constant("<init>");
+        let code_idx = self.add_utf8_constant("Code");
+
+        let mut descriptor = String::from("(");
+        for (_, param_type) in &ctor.params {
+            descriptor.push_str(&param_type.to_jvm_descriptor());
+        }
+        descriptor.push_str(")V");
+        let desc_idx = self.add_utf8_constant(&descriptor);
+
+        bytes.extend_from_slice(&ACC_PUBLIC.to_be_bytes());
+        bytes.extend_from_slice(&init_idx.to_be_bytes());
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+
+        self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_locals = 1;
+        self.local_vars
+            .insert("this".to_string(), (0, VarType::Ref));
+
+        let mut param_idx = 1;
+        for (param_name, param_type) in &ctor.params {
+            let var_type = self.type_to_var_type(param_type);
+            let slots = match var_type {
+                VarType::Long | VarType::Double => 2,
+                _ => 1,
+            };
+            self.local_vars
+                .insert(param_name.clone(), (param_idx, var_type));
+            param_idx += slots;
+        }
+        self.max_locals = param_idx;
+
+        self.code_buffer.push(0x2A);
+        let parent_class = class
+            .extends
+            .clone()
+            .unwrap_or_else(|| "java/lang/Object".to_string());
+        let parent_init_idx = self.add_methodref_constant(&parent_class, "<init>", "()V");
+        self.code_buffer.push(0xB7);
+        self.code_buffer
+            .extend_from_slice(&parent_init_idx.to_be_bytes());
+
+        for promoted in &ctor.promoted_params {
+            self.code_buffer.push(0x2A);
+            self.emit_load_var(&promoted.name)?;
+            let field_descriptor = promoted.param_type.to_jvm_descriptor();
+            let field_idx =
+                self.add_fieldref_constant(&class.name, &promoted.name, &field_descriptor);
+            self.code_buffer.push(0xB5);
+            self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+        }
+
+        for stmt in &ctor.body {
+            self.emit_stmt(stmt)?;
+        }
+
+        self.code_buffer.push(0xB1);
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_idx.to_be_bytes());
+        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
+        bytes.extend_from_slice(&self.max_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
+
+        let code_len = self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+        bytes.extend_from_slice(&self.code_buffer);
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_enum_init_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
+        let init_idx = self.add_utf8_constant("<init>");
+        let desc_idx = self.add_utf8_constant("(Ljava/lang/String;I)V");
+        let code_idx = self.add_utf8_constant("Code");
+
+        let enum_init_idx =
+            self.add_methodref_constant("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V");
+
+        bytes.extend_from_slice(&ACC_PRIVATE.to_be_bytes());
+        bytes.extend_from_slice(&init_idx.to_be_bytes());
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+
+        let code = vec![0x2A, 0x2B, 0x2C, 0xB7];
+        let code_attr_len = 12 + code.len() as u32 + 2;
+        bytes.extend_from_slice(&code_idx.to_be_bytes());
+        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
+        bytes.extend_from_slice(&3u16.to_be_bytes());
+        bytes.extend_from_slice(&3u16.to_be_bytes());
+
+        let code_len = (code.len() + 2) as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+
+        bytes.extend_from_slice(&code);
+        bytes.extend_from_slice(&enum_init_idx.to_be_bytes());
+        bytes.push(0xB1);
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_abstract_method(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        method: &ClassMethod,
+    ) -> CompileResult<()> {
+        let access_flags = ACC_ABSTRACT | ACC_PUBLIC;
+
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&method.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = self.build_method_descriptor(method);
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(())
     }
 
     fn emit_main_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
@@ -1261,8 +1533,19 @@ impl CodeGen {
         method_name: &str,
         args: &[Expr],
     ) -> CompileResult<()> {
-        // Resolve self:: and parent:: to actual class names
         let resolved_class = self.resolve_static_class(class_name);
+
+        if class_name == "parent" && method_name == "__construct" || method_name == "<init>" {
+            self.code_buffer.push(0x2A);
+            for arg in args {
+                self.emit_expr(arg)?;
+            }
+            let descriptor = self.build_constructor_descriptor_from_args(args);
+            let init_idx = self.add_methodref_constant(&resolved_class, "<init>", &descriptor);
+            self.code_buffer.push(0xB7);
+            self.code_buffer.extend_from_slice(&init_idx.to_be_bytes());
+            return Ok(());
+        }
 
         for arg in args {
             self.emit_expr(arg)?;
@@ -1270,7 +1553,7 @@ impl CodeGen {
 
         let descriptor = self.build_method_descriptor_from_args(args);
         let method_idx = self.add_methodref_constant(&resolved_class, method_name, &descriptor);
-        self.code_buffer.push(0xB8); // invokestatic
+        self.code_buffer.push(0xB8);
         self.code_buffer
             .extend_from_slice(&method_idx.to_be_bytes());
 

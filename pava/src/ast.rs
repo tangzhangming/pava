@@ -98,10 +98,22 @@ pub struct ClassField {
 pub struct ClassMethod {
     pub name: String,
     pub params: Vec<(String, Type)>,
+    pub promoted_params: Vec<PromotedParam>,
     pub return_type: Type,
     pub body: Vec<Stmt>,
     pub is_static: bool,
     pub is_public: bool,
+    pub is_abstract: bool,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromotedParam {
+    pub name: String,
+    pub param_type: Type,
+    pub is_public: bool,
+    pub is_private: bool,
+    pub is_protected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +132,7 @@ pub struct Class {
     pub is_open: bool,
     pub is_interface: bool,
     pub is_enum: bool,
+    pub enum_backed_type: Option<Type>,
     pub fields: Vec<ClassField>,
     pub methods: Vec<ClassMethod>,
     pub constants: Vec<ClassConst>,

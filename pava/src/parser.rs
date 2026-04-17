@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOp, CaptureVar, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, EnumValue, Expr,
-    Stmt, Type, UnaryOp,
+    PromotedParam, Stmt, Type, UnaryOp,
 };
 use crate::error::{CompileError, CompileResult};
 use crate::lexer::{Lexer, Token};
@@ -44,6 +44,7 @@ impl Parser {
         let mut is_interface = false;
         let mut is_enum = false;
         let mut is_open = false;
+        let mut enum_backed_type = None;
 
         match &self.current_token {
             Token::Open => {
@@ -85,6 +86,11 @@ impl Parser {
         };
         self.class_name = name.clone();
         self.bump();
+
+        if is_enum && self.current_token == Token::Colon {
+            self.bump();
+            enum_backed_type = Some(self.parse_type()?);
+        }
 
         let mut extends = None;
         let mut implements = Vec::new();
@@ -166,7 +172,7 @@ impl Parser {
                     self.bump();
                     if self.current_token == Token::Function {
                         self.bump();
-                        let m = self.parse_method(true, true)?;
+                        let m = self.parse_method_with_flags(true, true, false, false, false)?;
                         methods.push(m);
                     } else {
                         let mut f = self.parse_field()?;
@@ -176,7 +182,15 @@ impl Parser {
                 }
                 Token::Function => {
                     self.bump();
-                    let m = self.parse_method(true, true)?;
+                    let is_abstract_method = is_abstract && !is_interface;
+                    let is_default_method = is_interface;
+                    let m = self.parse_method_with_flags(
+                        false,
+                        true,
+                        is_abstract_method,
+                        is_default_method,
+                        false,
+                    )?;
                     methods.push(m);
                 }
                 Token::Public | Token::Private => {
@@ -187,7 +201,9 @@ impl Parser {
                             self.bump();
                             if self.current_token == Token::Function {
                                 self.bump();
-                                let m = self.parse_method(true, is_public)?;
+                                let m = self.parse_method_with_flags(
+                                    true, is_public, false, false, false,
+                                )?;
                                 methods.push(m);
                             } else {
                                 let mut f = self.parse_field()?;
@@ -197,12 +213,15 @@ impl Parser {
                         }
                         Token::Function => {
                             self.bump();
-                            let m = self.parse_method(false, is_public)?;
-                            if m.name == "__construct" {
-                                constructor = Some(m);
-                            } else {
-                                methods.push(m);
-                            }
+                            let m =
+                                self.parse_method_with_flags(false, is_public, false, false, true)?;
+                            constructor = Some(m);
+                        }
+                        Token::Abstract => {
+                            self.bump();
+                            self.expect(Token::Function)?;
+                            let m = self.parse_abstract_method(is_public)?;
+                            methods.push(m);
                         }
                         _ => {
                             let f = self.parse_field()?;
@@ -210,10 +229,16 @@ impl Parser {
                         }
                     }
                 }
+                Token::Abstract => {
+                    self.bump();
+                    self.expect(Token::Function)?;
+                    let m = self.parse_abstract_method(true)?;
+                    methods.push(m);
+                }
                 Token::Identifier(n) => {
                     if n == "__construct" {
                         self.bump();
-                        let m = self.parse_method(false, true)?;
+                        let m = self.parse_method_with_flags(false, true, false, false, true)?;
                         constructor = Some(m);
                     } else {
                         let f = self.parse_field()?;
@@ -237,6 +262,7 @@ impl Parser {
             is_open,
             is_interface,
             is_enum,
+            enum_backed_type,
             fields,
             methods,
             constants,
@@ -316,11 +342,73 @@ impl Parser {
     }
 
     fn parse_method(&mut self, is_static: bool, is_public: bool) -> CompileResult<ClassMethod> {
+        self.parse_method_with_flags(is_static, is_public, false, false, false)
+    }
+
+    fn parse_method_with_flags(
+        &mut self,
+        is_static: bool,
+        is_public: bool,
+        is_abstract: bool,
+        is_default: bool,
+        is_constructor: bool,
+    ) -> CompileResult<ClassMethod> {
         let name = match &self.current_token {
             Token::Identifier(n) => n.clone(),
             _ => {
                 return Err(CompileError::ParserError(
                     "Expected method name".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        self.expect(Token::LParen)?;
+        let (params, promoted_params) = if is_constructor {
+            self.parse_params_with_promoted()?
+        } else {
+            (self.parse_params()?, Vec::new())
+        };
+        self.expect(Token::RParen)?;
+
+        let return_type = if self.current_token == Token::Colon {
+            self.bump();
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+
+        let body = if is_abstract && self.current_token == Token::Semicolon {
+            self.bump();
+            Vec::new()
+        } else if is_default || !is_abstract {
+            self.expect(Token::LBrace)?;
+            let body = self.parse_block()?;
+            self.expect(Token::RBrace)?;
+            body
+        } else {
+            Vec::new()
+        };
+
+        Ok(ClassMethod {
+            name,
+            params,
+            promoted_params,
+            return_type,
+            body,
+            is_static,
+            is_public,
+            is_abstract,
+            is_default,
+        })
+    }
+
+    fn parse_abstract_method(&mut self, is_public: bool) -> CompileResult<ClassMethod> {
+        let name = match &self.current_token {
+            Token::Identifier(n) => n.clone(),
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected abstract method name".to_string(),
                 ))
             }
         };
@@ -337,17 +425,18 @@ impl Parser {
             Type::Void
         };
 
-        self.expect(Token::LBrace)?;
-        let body = self.parse_block()?;
-        self.expect(Token::RBrace)?;
+        self.expect(Token::Semicolon)?;
 
         Ok(ClassMethod {
             name,
             params,
+            promoted_params: Vec::new(),
             return_type,
-            body,
-            is_static,
+            body: Vec::new(),
+            is_static: false,
             is_public,
+            is_abstract: true,
+            is_default: false,
         })
     }
 
@@ -380,6 +469,67 @@ impl Parser {
         }
 
         Ok(params)
+    }
+
+    fn parse_params_with_promoted(
+        &mut self,
+    ) -> CompileResult<(Vec<(String, Type)>, Vec<PromotedParam>)> {
+        let mut params = Vec::new();
+        let mut promoted_params = Vec::new();
+
+        if self.current_token != Token::RParen {
+            loop {
+                let mut is_public = false;
+                let mut is_private = false;
+                let mut is_protected = false;
+
+                if matches!(
+                    &self.current_token,
+                    Token::Public | Token::Private | Token::Protected
+                ) {
+                    match &self.current_token {
+                        Token::Public => is_public = true,
+                        Token::Private => is_private = true,
+                        Token::Protected => is_protected = true,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+
+                let param_type = self.parse_type()?;
+
+                let param_name = match &self.current_token {
+                    Token::Variable(n) => n.clone(),
+                    Token::Identifier(n) => n.clone(),
+                    _ => {
+                        return Err(CompileError::ParserError(
+                            "Expected parameter name".to_string(),
+                        ))
+                    }
+                };
+                self.bump();
+
+                params.push((param_name.clone(), param_type.clone()));
+
+                if is_public || is_private || is_protected {
+                    promoted_params.push(PromotedParam {
+                        name: param_name,
+                        param_type,
+                        is_public,
+                        is_private,
+                        is_protected,
+                    });
+                }
+
+                if self.current_token == Token::Comma {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok((params, promoted_params))
     }
 
     fn parse_type(&mut self) -> CompileResult<Type> {
