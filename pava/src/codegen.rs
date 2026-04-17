@@ -37,6 +37,8 @@ pub struct CodeGen {
     println_string_idx: u16,
     class_idx: u16,
     super_class_idx: u16,
+    class_name: String,
+    parent_class_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,10 +83,14 @@ impl CodeGen {
             println_string_idx: 0,
             class_idx: 0,
             super_class_idx: 0,
+            class_name: String::new(),
+            parent_class_name: None,
         }
     }
 
     pub fn generate(&mut self, class: Class) -> CompileResult<Vec<u8>> {
+        self.class_name = class.name.clone();
+        self.parent_class_name = class.extends.clone();
         self.collect_constants_from_class(&class);
         self.init_constant_pool(&class);
         self.emit_class(&class)
@@ -284,18 +290,44 @@ impl CodeGen {
             self.emit_cp_entry(&mut bytes, entry);
         }
 
-        let access_flags = ACC_SUPER;
+        let access_flags = if class.is_interface {
+            0x0201
+        } else {
+            ACC_SUPER
+        } | if class.is_abstract { 0x0400 } else { 0 }
+            | if class.is_final { 0x0010 } else { 0 };
         bytes.extend_from_slice(&access_flags.to_be_bytes());
 
         bytes.extend_from_slice(&self.class_idx.to_be_bytes());
         bytes.extend_from_slice(&self.super_class_idx.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        // Interfaces count
         bytes.extend_from_slice(&0u16.to_be_bytes());
 
-        let method_count = class.methods.len() as u16 + 1;
+        // Fields count - include constants as static final fields
+        let fields_count = class.fields.len() as u16 + class.constants.len() as u16;
+        bytes.extend_from_slice(&fields_count.to_be_bytes());
+
+        // Emit constants as static final fields
+        for const_decl in &class.constants {
+            self.emit_const_field(&mut bytes, const_decl);
+        }
+
+        // Emit regular fields
+        for field in &class.fields {
+            self.emit_field(&mut bytes, field);
+        }
+
+        // Methods count - include <init> and potentially <clinit>
+        let has_clinit = !class.constants.is_empty();
+        let method_count = class.methods.len() as u16 + 1 + if has_clinit { 1 } else { 0 };
         bytes.extend_from_slice(&method_count.to_be_bytes());
 
         self.emit_init_method(&mut bytes);
+
+        if has_clinit {
+            self.emit_clinit_method(&mut bytes, class)?;
+        }
 
         for method in &class.methods {
             if method.name == "main" {
@@ -308,6 +340,100 @@ impl CodeGen {
         bytes.extend_from_slice(&0u16.to_be_bytes());
 
         Ok(bytes)
+    }
+
+    fn emit_const_field(&mut self, bytes: &mut Vec<u8>, const_decl: &ClassConst) {
+        let access_flags = ACC_PUBLIC | ACC_STATIC | 0x0010; // public static final
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&const_decl.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = self.infer_const_descriptor(&const_decl.value);
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        // No attributes for now - value is set in <clinit>
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_field(&mut self, bytes: &mut Vec<u8>, field: &ClassField) {
+        let access_flags = if field.is_public { ACC_PUBLIC } else { 0 }
+            | if field.is_private { 0x0002 } else { 0 }
+            | if field.is_protected { 0x0004 } else { 0 }
+            | if field.is_static { ACC_STATIC } else { 0 }
+            | if field.is_final { 0x0010 } else { 0 };
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&field.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = field.field_type.to_jvm_descriptor();
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_clinit_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
+        let clinit_idx = self.add_utf8_constant("<clinit>");
+        let void_desc_idx = self.add_utf8_constant("()V");
+        let code_idx = self.add_utf8_constant("Code");
+
+        bytes.extend_from_slice(&ACC_STATIC.to_be_bytes());
+        bytes.extend_from_slice(&clinit_idx.to_be_bytes());
+        bytes.extend_from_slice(&void_desc_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+
+        self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_locals = 0;
+
+        for const_decl in &class.constants {
+            self.emit_const_assignment(const_decl)?;
+        }
+
+        self.code_buffer.push(0xB1); // return
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_idx.to_be_bytes());
+        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
+        bytes.extend_from_slice(&self.max_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
+
+        let code_len = self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+        bytes.extend_from_slice(&self.code_buffer);
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_const_assignment(&mut self, const_decl: &ClassConst) -> CompileResult<()> {
+        self.emit_expr(&const_decl.value)?;
+
+        let class_name = self.class_name.clone();
+        let const_name = const_decl.name.clone();
+        let descriptor = self.infer_const_descriptor(&const_decl.value);
+
+        let field_idx = self.add_fieldref_constant(&class_name, &const_name, &descriptor);
+        self.code_buffer.push(0xB3); // putstatic
+        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn infer_const_descriptor(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::IntLiteral(_) => "I",
+            Expr::FloatLiteral(_) => "D",
+            Expr::StringLiteral(_) => "Ljava/lang/String;",
+            Expr::BoolLiteral(_) => "Z",
+            _ => "Ljava/lang/Object;",
+        }
+        .to_string()
     }
 
     fn emit_method(&mut self, bytes: &mut Vec<u8>, method: &ClassMethod) -> CompileResult<()> {
@@ -578,7 +704,14 @@ impl CodeGen {
                 self.emit_static_call(class_name, method_name, args)?
             }
             Expr::FieldAccess(obj, field_name) => self.emit_field_access(obj, field_name)?,
-            _ => {}
+            Expr::StaticFieldAccess(class_name, field_name) => {
+                self.emit_static_field_access(class_name, field_name)?
+            }
+            Expr::Closure(closure) => self.emit_closure(closure)?,
+            Expr::ClosureCall(func, args) => self.emit_closure_call(func, args)?,
+            Expr::NewObject(class_name, args) => self.emit_new_object(class_name, args)?,
+            Expr::Cast(expr, target_type) => self.emit_cast(expr, target_type)?,
+            // Unhandled expression types - can be extended
         }
         Ok(())
     }
@@ -784,8 +917,203 @@ impl CodeGen {
                 self.emit_expr(right)?;
                 self.code_buffer.push(0x80);
             }
+            BinaryOp::Assign => {
+                self.emit_expr(right)?;
+                self.emit_store_field(left)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_store_field(&mut self, obj: &Expr) -> CompileResult<()> {
+        let class_name = self.infer_class_name_from_expr(obj);
+        let field_idx = self.add_fieldref_constant(&class_name, "value", "I");
+        self.code_buffer.push(0xB5);
+        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+        Ok(())
+    }
+
+    fn emit_cast(&mut self, expr: &Expr, _ty: &Type) -> CompileResult<()> {
+        self.emit_expr(expr)?;
+        Ok(())
+    }
+
+    /// 生成闭包表达式代码
+    fn emit_closure(&mut self, closure: &ClosureExpr) -> CompileResult<()> {
+        for capture in &closure.captures {
+            if capture.is_reference {
+                self.emit_ensure_ref_wrapped(&capture.name)?;
+            }
+        }
+
+        // Generate inner class for the closure
+        // For simplicity, we use anonymous inner class approach
+        // Full LambdaMetafactory implementation would require bootstrap method generation
+
+        let closure_class_name =
+            format!("{}$Closure{}", self.class_name, self.generate_closure_id());
+
+        // Create new closure instance
+        let closure_class_idx = self.add_class_constant(&closure_class_name);
+        self.code_buffer.push(0xBB); // new
+        self.code_buffer
+            .extend_from_slice(&closure_class_idx.to_be_bytes());
+        self.code_buffer.push(0x59); // dup
+
+        // Pass captured variables to constructor
+        for capture in &closure.captures {
+            if capture.is_reference {
+                // Load Ref wrapper
+                self.emit_load_var(&capture.name)?;
+            } else {
+                // Load value directly - need to box if primitive
+                self.emit_load_var(&capture.name)?;
+                let var_type = self
+                    .local_vars
+                    .get(&capture.name)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(VarType::Ref);
+                self.emit_box_value(var_type)?;
+            }
+        }
+
+        // Call constructor
+        let ctor_desc = self.build_closure_ctor_descriptor(&closure.captures);
+        let ctor_idx = self.add_methodref_constant(&closure_class_name, "<init>", &ctor_desc);
+        self.code_buffer.push(0xB7); // invokespecial
+        self.code_buffer.extend_from_slice(&ctor_idx.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn generate_closure_id(&self) -> u32 {
+        // Simple counter - in production would track per-class
+        1
+    }
+
+    fn build_closure_ctor_descriptor(&self, captures: &[crate::ast::CaptureVar]) -> String {
+        let mut desc = String::from("(");
+        for _ in captures {
+            desc.push_str("Ljava/lang/Object;");
+        }
+        desc.push_str(")V");
+        desc
+    }
+
+    /// 确保变量被包装在 Ref 对象中
+    fn emit_ensure_ref_wrapped(&mut self, name: &str) -> CompileResult<()> {
+        if let Some(&(_idx, ty)) = self.local_vars.get(name) {
+            if ty == VarType::Ref {
+                return Ok(()); // Already wrapped
+            }
+
+            // Box primitive if needed
+            self.emit_load_var(name)?;
+            self.emit_box_value(ty)?;
+
+            // Create Ref object
+            let ref_class_idx = self.add_class_constant("pava/lang/Ref");
+            self.code_buffer.push(0xBB); // new
+            self.code_buffer
+                .extend_from_slice(&ref_class_idx.to_be_bytes());
+            self.code_buffer.push(0x59); // dup
+            self.code_buffer.push(0x5F); // swap (put value on top for constructor)
+
+            // Call constructor with value
+            let init_idx =
+                self.add_methodref_constant("pava/lang/Ref", "<init>", "(Ljava/lang/Object;)V");
+            self.code_buffer.push(0xB7); // invokespecial
+            self.code_buffer.extend_from_slice(&init_idx.to_be_bytes());
+
+            // Store Ref back to variable
+            self.emit_store_var(name, VarType::Ref)?;
+        }
+        Ok(())
+    }
+
+    fn emit_box_value(&mut self, ty: VarType) -> CompileResult<()> {
+        match ty {
+            VarType::Int => {
+                let idx = self.add_methodref_constant(
+                    "java/lang/Integer",
+                    "valueOf",
+                    "(I)Ljava/lang/Integer;",
+                );
+                self.code_buffer.push(0xB8);
+                self.code_buffer.extend_from_slice(&idx.to_be_bytes());
+            }
+            VarType::Long => {
+                let idx =
+                    self.add_methodref_constant("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+                self.code_buffer.push(0xB8);
+                self.code_buffer.extend_from_slice(&idx.to_be_bytes());
+            }
+            VarType::Float => {
+                let idx = self.add_methodref_constant(
+                    "java/lang/Float",
+                    "valueOf",
+                    "(F)Ljava/lang/Float;",
+                );
+                self.code_buffer.push(0xB8);
+                self.code_buffer.extend_from_slice(&idx.to_be_bytes());
+            }
+            VarType::Double => {
+                let idx = self.add_methodref_constant(
+                    "java/lang/Double",
+                    "valueOf",
+                    "(D)Ljava/lang/Double;",
+                );
+                self.code_buffer.push(0xB8);
+                self.code_buffer.extend_from_slice(&idx.to_be_bytes());
+            }
+            VarType::Bool => {
+                let idx = self.add_methodref_constant(
+                    "java/lang/Boolean",
+                    "valueOf",
+                    "(Z)Ljava/lang/Boolean;",
+                );
+                self.code_buffer.push(0xB8);
+                self.code_buffer.extend_from_slice(&idx.to_be_bytes());
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// 生成闭包调用代码
+    fn emit_closure_call(&mut self, func: &Expr, args: &[Expr]) -> CompileResult<()> {
+        self.emit_expr(func)?;
+
+        // Create Object[] array for arguments
+        let array_len = args.len() as i32;
+        self.emit_integer(array_len as i64)?;
+
+        // anewarray java/lang/Object
+        let obj_class_idx = self.add_class_constant("java/lang/Object");
+        self.code_buffer.push(0xBD); // anewarray
+        self.code_buffer
+            .extend_from_slice(&obj_class_idx.to_be_bytes());
+
+        // Store each argument in array
+        for (i, arg) in args.iter().enumerate() {
+            self.code_buffer.push(0x59); // dup array
+            self.emit_integer(i as i64)?; // index
+            self.emit_expr(arg)?;
+            self.emit_box_value(self.infer_expr_type(arg))?;
+            self.code_buffer.push(0x53); // aastore
+        }
+
+        // Call Callable.call method
+        let callable_idx = self.add_methodref_constant(
+            "pava/lang/Callable",
+            "call",
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+
+        self.code_buffer.push(0xB6); // invokevirtual
+        self.code_buffer
+            .extend_from_slice(&callable_idx.to_be_bytes());
+
         Ok(())
     }
 
@@ -933,27 +1261,97 @@ impl CodeGen {
         method_name: &str,
         args: &[Expr],
     ) -> CompileResult<()> {
+        // Resolve self:: and parent:: to actual class names
+        let resolved_class = self.resolve_static_class(class_name);
+
         for arg in args {
             self.emit_expr(arg)?;
         }
 
         let descriptor = self.build_method_descriptor_from_args(args);
-        let method_idx = self.add_methodref_constant(class_name, method_name, &descriptor);
-        self.code_buffer.push(0xB8);
+        let method_idx = self.add_methodref_constant(&resolved_class, method_name, &descriptor);
+        self.code_buffer.push(0xB8); // invokestatic
         self.code_buffer
             .extend_from_slice(&method_idx.to_be_bytes());
 
         Ok(())
     }
 
+    fn emit_static_field_access(
+        &mut self,
+        class_name: &str,
+        field_name: &str,
+    ) -> CompileResult<()> {
+        let resolved_class = self.resolve_static_class(class_name);
+
+        let field_idx = self.add_fieldref_constant(&resolved_class, field_name, "I");
+        self.code_buffer.push(0xB2); // getstatic
+        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn resolve_static_class(&self, class_name: &str) -> String {
+        match class_name {
+            "self" => self.class_name.clone(),
+            "parent" => self
+                .parent_class_name
+                .clone()
+                .unwrap_or_else(|| "java/lang/Object".to_string()),
+            _ => class_name.to_string(),
+        }
+    }
+
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {
         self.emit_expr(obj)?;
         let class_name = self.infer_class_name_from_expr(obj);
         let field_idx = self.add_fieldref_constant(&class_name, field_name, "I");
-        self.code_buffer.push(0xB4);
+        self.code_buffer.push(0xB4); // getfield
         self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
 
         Ok(())
+    }
+
+    fn emit_new_object(&mut self, class_name: &str, args: &[Expr]) -> CompileResult<()> {
+        let class_idx = self.add_class_constant(class_name);
+        self.code_buffer.push(0xBB); // new
+        self.code_buffer.extend_from_slice(&class_idx.to_be_bytes());
+        self.code_buffer.push(0x59); // dup
+
+        for arg in args {
+            self.emit_expr(arg)?;
+        }
+
+        let init_descriptor = self.build_constructor_descriptor_from_args(args);
+        let init_idx = self.add_methodref_constant(class_name, "<init>", &init_descriptor);
+        self.code_buffer.push(0xB7); // invokespecial
+        self.code_buffer.extend_from_slice(&init_idx.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn build_constructor_descriptor_from_args(&self, args: &[Expr]) -> String {
+        let mut desc = String::from("(");
+        for arg in args {
+            desc.push_str(&self.infer_jvm_type_from_expr(arg));
+        }
+        desc.push_str(")V");
+        desc
+    }
+
+    fn infer_jvm_type_from_expr(&self, expr: &Expr) -> String {
+        match self.infer_expr_type(expr) {
+            VarType::Byte => "B",
+            VarType::Short => "S",
+            VarType::Int => "I",
+            VarType::Long => "J",
+            VarType::Float => "F",
+            VarType::Double => "D",
+            VarType::Bool => "Z",
+            VarType::String => "Ljava/lang/String;",
+            VarType::Ref => "Ljava/lang/Object;",
+        }
+        .to_string()
     }
 
     fn build_method_descriptor_from_args(&self, args: &[Expr]) -> String {

@@ -117,6 +117,7 @@ pub struct Class {
     pub implements: Vec<String>,
     pub is_abstract: bool,
     pub is_final: bool,
+    pub is_open: bool,
     pub is_interface: bool,
     pub is_enum: bool,
     pub fields: Vec<ClassField>,

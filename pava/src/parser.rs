@@ -43,8 +43,14 @@ impl Parser {
         let mut is_final = false;
         let mut is_interface = false;
         let mut is_enum = false;
+        let mut is_open = false;
 
         match &self.current_token {
+            Token::Open => {
+                is_open = true;
+                self.bump();
+                self.expect(Token::Class)?;
+            }
             Token::Abstract => {
                 is_abstract = true;
                 self.bump();
@@ -228,6 +234,7 @@ impl Parser {
             implements,
             is_abstract,
             is_final,
+            is_open,
             is_interface,
             is_enum,
             fields,
@@ -670,6 +677,13 @@ impl Parser {
 
         loop {
             match &self.current_token {
+                Token::LParen => {
+                    // Closure call $fn(...) or regular function call
+                    self.bump();
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    expr = Expr::ClosureCall(Box::new(expr), args);
+                }
                 Token::Dot | Token::Arrow => {
                     self.bump();
                     let member = match &self.current_token {
@@ -729,17 +743,6 @@ impl Parser {
                 Ok(Expr::NullLiteral)
             }
             Token::Function => self.parse_closure(),
-            Token::Variable(_) => {
-                let var_expr = self.parse_primary()?;
-                // 检查是否是闭包调用 $fn(...)
-                if self.current_token == Token::LParen {
-                    self.bump();
-                    let args = self.parse_args()?;
-                    self.expect(Token::RParen)?;
-                    return Ok(Expr::ClosureCall(Box::new(var_expr), args));
-                }
-                Ok(var_expr)
-            }
             Token::New => {
                 self.bump();
                 let class = match &self.current_token {
@@ -761,18 +764,42 @@ impl Parser {
             _ => {
                 let name = match &self.current_token {
                     Token::Identifier(n) => n.clone(),
+                    Token::SelfRef => "self".to_string(),
+                    Token::Parent => "parent".to_string(),
                     _ => return Err(CompileError::ParserError("Unexpected token".to_string())),
                 };
                 self.bump();
 
-                if self.current_token == Token::LParen {
+                // Handle :: for static method/field access (self::, parent::, ClassName::)
+                if self.current_token == Token::DoubleColon {
+                    self.bump();
+                    let member = match &self.current_token {
+                        Token::Identifier(n) => n.clone(),
+                        Token::Variable(n) => n.trim_start_matches('$').to_string(),
+                        _ => {
+                            return Err(CompileError::ParserError(
+                                "Expected static member name".to_string(),
+                            ))
+                        }
+                    };
+                    self.bump();
+
+                    if self.current_token == Token::LParen {
+                        self.bump();
+                        let args = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::StaticCall(name, member, args))
+                    } else {
+                        Ok(Expr::StaticFieldAccess(name, member))
+                    }
+                } else if self.current_token == Token::LParen {
                     self.bump();
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    return Ok(Expr::NewObject(name, args));
+                    Ok(Expr::NewObject(name, args))
+                } else {
+                    Ok(Expr::Variable(name))
                 }
-
-                Ok(Expr::Variable(name))
             }
         }
     }
@@ -877,6 +904,12 @@ impl Parser {
         }
         Ok(expr)
     }
+}
+
+/// 解析源代码为 Class AST
+pub fn parse(source: &str) -> CompileResult<Class> {
+    let mut parser = Parser::new(source.to_string());
+    parser.parse_class()
 }
 
 #[cfg(test)]

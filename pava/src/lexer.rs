@@ -33,6 +33,7 @@ pub enum Token {
     Extends,
     Implements,
     Case,
+    Open,
 
     // Types
     Type(String),
@@ -89,6 +90,12 @@ pub enum Token {
     RBracket,
     LBrace,
     RBrace,
+
+    // Annotation
+    At,
+
+    // Scope resolution
+    DoubleColon,
 
     Eof,
 }
@@ -245,7 +252,6 @@ impl Lexer {
             }
             ';' => Token::Semicolon,
             ',' => Token::Comma,
-            ':' => Token::Colon,
             '.' => Token::Dot,
             '(' => Token::LParen,
             ')' => Token::RParen,
@@ -305,6 +311,17 @@ impl Lexer {
                 }
             }
             '~' => Token::Tilde,
+            '@' => Token::At,
+            ':' => {
+                // Check for :: (DoubleColon)
+                let next_ch = self.peek_char();
+                if next_ch == ':' {
+                    self.read_char();
+                    Token::DoubleColon
+                } else {
+                    Token::Colon
+                }
+            }
             _ => {
                 return Err(CompileError::LexerError(format!(
                     "Unknown character: {}",
@@ -365,6 +382,7 @@ impl Lexer {
             "extends" => Token::Extends,
             "implements" => Token::Implements,
             "case" => Token::Case,
+            "open" => Token::Open,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,
             "int8" => Token::TypeInt8,
