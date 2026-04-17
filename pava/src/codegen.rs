@@ -24,7 +24,14 @@ enum JvmCategory {
     Ref,
 }
 
+struct LoopContext {
+    continue_target: usize,
+    break_patches: Vec<usize>,
+}
+
 pub struct CodeGen {
+    loop_stack: Vec<LoopContext>,
+    class_fields: HashMap<String, Type>,
     constant_pool: Vec<ConstantPoolEntry>,
     code_buffer: Vec<u8>,
     local_vars: HashMap<String, (u16, VarType)>,
@@ -76,6 +83,8 @@ const ACC_ENUM: u16 = 0x4000;
 impl CodeGen {
     pub fn new(_class: Class) -> Self {
         CodeGen {
+            loop_stack: Vec::new(),
+            class_fields: HashMap::new(),
             constant_pool: Vec::new(),
             code_buffer: Vec::new(),
             local_vars: HashMap::new(),
@@ -106,6 +115,11 @@ impl CodeGen {
         self.class_name = class.name.clone();
         self.parent_class_name = class.extends.clone();
 
+        for field in &class.fields {
+            self.class_fields
+                .insert(field.name.clone(), field.field_type.clone());
+        }
+
         if class.is_enum {
             self.parent_class_name = Some("java/lang/Enum".to_string());
         }
@@ -130,12 +144,23 @@ impl CodeGen {
     fn collect_constants_from_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(expr) => self.collect_constants_from_expr(expr),
-            Stmt::Return(Some(expr)) => self.collect_constants_from_expr(expr),
+            Stmt::Return(expr) => {
+                if let Some(e) = expr {
+                    self.collect_constants_from_expr(e);
+                }
+            }
             Stmt::Assign(_, expr) => self.collect_constants_from_expr(expr),
-            Stmt::If(cond, then_branch, else_branch) => {
+            Stmt::TypedAssign(_, _, expr) => self.collect_constants_from_expr(expr),
+            Stmt::If(cond, then_branch, elseif_pairs, else_branch) => {
                 self.collect_constants_from_expr(cond);
                 for s in then_branch {
                     self.collect_constants_from_stmt(s);
+                }
+                for (ei_cond, ei_body) in elseif_pairs {
+                    self.collect_constants_from_expr(ei_cond);
+                    for s in ei_body {
+                        self.collect_constants_from_stmt(s);
+                    }
                 }
                 if let Some(else_stmts) = else_branch {
                     for s in else_stmts {
@@ -149,13 +174,27 @@ impl CodeGen {
                     self.collect_constants_from_stmt(s);
                 }
             }
+            Stmt::For(init, cond, update, body) => {
+                self.collect_constants_from_stmt(init);
+                self.collect_constants_from_expr(cond);
+                self.collect_constants_from_stmt(update);
+                for s in body {
+                    self.collect_constants_from_stmt(s);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
             Stmt::Print(expr) | Stmt::Println(expr) => self.collect_constants_from_expr(expr),
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.collect_constants_from_stmt(s);
                 }
             }
-            _ => {}
+            Stmt::Printf(fmt, args) => {
+                self.collect_constants_from_expr(fmt);
+                for arg in args {
+                    self.collect_constants_from_expr(arg);
+                }
+            }
         }
     }
 
@@ -948,18 +987,58 @@ impl CodeGen {
                 }
                 self.code_buffer.push(0xB1);
             }
-            Stmt::If(cond, then_stmts, else_stmts) => self.emit_if(cond, then_stmts, else_stmts)?,
+            Stmt::If(cond, then_stmts, elseif_pairs, else_stmts) => {
+                self.emit_if_with_elseif(cond, then_stmts, elseif_pairs, else_stmts)?
+            }
             Stmt::While(cond, stmts) => self.emit_while(cond, stmts)?,
+            Stmt::For(init, cond, update, body) => self.emit_for(init, cond, update, body)?,
             Stmt::Assign(name, expr) => self.emit_assign(name, expr)?,
+            Stmt::TypedAssign(name, ty, expr) => self.emit_typed_assign(name, ty, expr)?,
+            Stmt::Break => self.emit_break(),
+            Stmt::Continue => self.emit_continue(),
             Stmt::Print(expr) | Stmt::Println(expr) => self.emit_print(expr)?,
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.emit_stmt(s)?;
                 }
             }
-            _ => {}
+            Stmt::Printf(_, _) => {}
         }
         Ok(())
+    }
+
+    fn emit_typed_assign(&mut self, name: &str, ty: &Type, expr: &Expr) -> CompileResult<()> {
+        if matches!(expr, Expr::NullLiteral) && !ty.is_nullable() {
+            return Err(crate::error::CompileError::CodegenError(format!(
+                "Cannot assign null to non-nullable type {}",
+                ty.to_jvm_descriptor()
+            )));
+        }
+        let var_type = self.type_to_var_type(ty);
+        self.emit_expr(expr)?;
+        self.emit_store_var(name, var_type)?;
+        Ok(())
+    }
+
+    fn emit_break(&mut self) {
+        if let Some(ctx) = self.loop_stack.last() {
+            self.code_buffer.push(0xA7);
+            let patch_pos = self.code_buffer.len();
+            self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+            self.loop_stack
+                .last_mut()
+                .unwrap()
+                .break_patches
+                .push(patch_pos);
+        }
+    }
+
+    fn emit_continue(&mut self) {
+        if let Some(ctx) = self.loop_stack.last() {
+            self.code_buffer.push(0xA7);
+            let offset = (ctx.continue_target as i32 - self.code_buffer.len() as i32 - 3) as i16;
+            self.code_buffer.extend_from_slice(&offset.to_be_bytes());
+        }
     }
 
     fn emit_expr(&mut self, expr: &Expr) -> CompileResult<()> {
@@ -1160,9 +1239,21 @@ impl CodeGen {
     fn emit_binary_op(&mut self, op: &BinaryOp, left: &Expr, right: &Expr) -> CompileResult<()> {
         match op {
             BinaryOp::Add => {
-                self.emit_expr(left)?;
-                self.emit_expr(right)?;
-                self.code_buffer.push(0x60);
+                let left_ty = self.infer_expr_type(left);
+                let right_ty = self.infer_expr_type(right);
+
+                if left_ty == VarType::String || right_ty == VarType::String {
+                    self.emit_string_concat(left, right)?;
+                } else {
+                    self.emit_expr(left)?;
+                    self.emit_expr(right)?;
+                    match (left_ty, right_ty) {
+                        (VarType::Long, _) | (_, VarType::Long) => self.code_buffer.push(0x61),
+                        (VarType::Float, _) | (_, VarType::Float) => self.code_buffer.push(0x62),
+                        (VarType::Double, _) | (_, VarType::Double) => self.code_buffer.push(0x63),
+                        _ => self.code_buffer.push(0x60),
+                    }
+                }
             }
             BinaryOp::Sub => {
                 self.emit_expr(left)?;
@@ -1208,10 +1299,41 @@ impl CodeGen {
     }
 
     fn emit_store_field(&mut self, obj: &Expr) -> CompileResult<()> {
-        let class_name = self.infer_class_name_from_expr(obj);
-        let field_idx = self.add_fieldref_constant(&class_name, "value", "I");
-        self.code_buffer.push(0xB5);
-        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+        match obj {
+            Expr::FieldAccess(inner, field_name) => {
+                self.emit_expr(inner)?;
+                let class_name = self.infer_class_name_from_expr(inner);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            Expr::StaticFieldAccess(class_name, field_name) => {
+                let resolved_class = self.resolve_static_class(class_name);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx =
+                    self.add_fieldref_constant(&resolved_class, field_name, &field_type);
+                self.code_buffer.push(0xB3);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            Expr::Variable(name) => {
+                self.emit_store_var(name, VarType::Int)?;
+            }
+            _ => {
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_idx = self.add_fieldref_constant(&class_name, "value", "I");
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+        }
         Ok(())
     }
 
@@ -1474,6 +1596,54 @@ impl CodeGen {
         Ok(())
     }
 
+    fn emit_string_concat(&mut self, left: &Expr, right: &Expr) -> CompileResult<()> {
+        let sb_class = self.add_class_constant("java/lang/StringBuilder");
+        self.code_buffer.push(0xBB);
+        self.code_buffer.extend_from_slice(&sb_class.to_be_bytes());
+        self.code_buffer.push(0x59);
+
+        let sb_init = self.add_methodref_constant("java/lang/StringBuilder", "<init>", "()V");
+        self.code_buffer.push(0xB7);
+        self.code_buffer.extend_from_slice(&sb_init.to_be_bytes());
+
+        self.emit_append_to_stringbuilder(left)?;
+        self.emit_append_to_stringbuilder(right)?;
+
+        let to_string = self.add_methodref_constant(
+            "java/lang/StringBuilder",
+            "toString",
+            "()Ljava/lang/String;",
+        );
+        self.code_buffer.push(0xB6);
+        self.code_buffer.extend_from_slice(&to_string.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_append_to_stringbuilder(&mut self, expr: &Expr) -> CompileResult<()> {
+        self.code_buffer.push(0x59);
+        self.emit_expr(expr)?;
+
+        let ty = self.infer_expr_type(expr);
+        let desc = match ty {
+            VarType::Int => "(I)Ljava/lang/StringBuilder;",
+            VarType::Long => "(J)Ljava/lang/StringBuilder;",
+            VarType::Float => "(F)Ljava/lang/StringBuilder;",
+            VarType::Double => "(D)Ljava/lang/StringBuilder;",
+            VarType::Bool => "(Z)Ljava/lang/StringBuilder;",
+            VarType::Byte => "(I)Ljava/lang/StringBuilder;",
+            VarType::Short => "(I)Ljava/lang/StringBuilder;",
+            _ => "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+        };
+
+        let append_method = self.add_methodref_constant("java/lang/StringBuilder", "append", desc);
+        self.code_buffer.push(0xB6);
+        self.code_buffer
+            .extend_from_slice(&append_method.to_be_bytes());
+
+        Ok(())
+    }
+
     fn emit_comparison_op(
         &mut self,
         op: &BinaryOp,
@@ -1529,12 +1699,15 @@ impl CodeGen {
         Ok(())
     }
 
-    fn emit_if(
+    fn emit_if_with_elseif(
         &mut self,
         cond: &Expr,
         then_stmts: &[Stmt],
+        elseif_pairs: &[(Expr, Vec<Stmt>)],
         else_stmts: &Option<Vec<Stmt>>,
     ) -> CompileResult<()> {
+        let mut jmp_offsets = Vec::new();
+
         self.emit_expr(cond)?;
         let jmp_offset = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
@@ -1543,12 +1716,33 @@ impl CodeGen {
             self.emit_stmt(stmt)?;
         }
 
-        let else_offset = self.code_buffer.len();
+        let skip_offset = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
 
         let current = self.code_buffer.len() as u16;
         let then_end = (current - 4).to_be_bytes();
         self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&then_end);
+
+        jmp_offsets.push(skip_offset);
+
+        for (ei_cond, ei_body) in elseif_pairs {
+            self.emit_expr(ei_cond)?;
+            let ei_jmp = self.code_buffer.len();
+            self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+            for stmt in ei_body {
+                self.emit_stmt(stmt)?;
+            }
+
+            let ei_skip = self.code_buffer.len();
+            self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+            let current = self.code_buffer.len() as u16;
+            let ei_then_end = (current - 4).to_be_bytes();
+            self.code_buffer[ei_jmp..ei_jmp + 2].copy_from_slice(&ei_then_end);
+
+            jmp_offsets.push(ei_skip);
+        }
 
         if let Some(else_body) = else_stmts {
             for stmt in else_body {
@@ -1557,14 +1751,22 @@ impl CodeGen {
         }
 
         let current = self.code_buffer.len() as u16;
-        let else_end = (current - 2).to_be_bytes();
-        self.code_buffer[else_offset..else_offset + 2].copy_from_slice(&else_end);
+        for offset in jmp_offsets {
+            let end = (current - 2).to_be_bytes();
+            self.code_buffer[offset..offset + 2].copy_from_slice(&end);
+        }
 
         Ok(())
     }
 
     fn emit_while(&mut self, cond: &Expr, stmts: &[Stmt]) -> CompileResult<()> {
         let loop_start = self.code_buffer.len();
+
+        self.loop_stack.push(LoopContext {
+            continue_target: loop_start,
+            break_patches: Vec::new(),
+        });
+
         self.emit_expr(cond)?;
         let jmp_offset = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
@@ -1577,9 +1779,61 @@ impl CodeGen {
         let offset = (loop_start as i32 - self.code_buffer.len() as i32 - 3) as i16;
         self.code_buffer.extend_from_slice(&offset.to_be_bytes());
 
-        let current = self.code_buffer.len() as u16;
-        let target = (current - 2).to_be_bytes();
+        let loop_end = self.code_buffer.len();
+        let target = (loop_end as i16 - 2).to_be_bytes();
         self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&target);
+
+        if let Some(ctx) = self.loop_stack.pop() {
+            for patch_pos in ctx.break_patches {
+                let offset = (loop_end as i32 - patch_pos as i32 + 1) as i16;
+                self.code_buffer[patch_pos..patch_pos + 2].copy_from_slice(&offset.to_be_bytes());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn emit_for(
+        &mut self,
+        init: &Stmt,
+        cond: &Expr,
+        update: &Stmt,
+        body: &[Stmt],
+    ) -> CompileResult<()> {
+        self.emit_stmt(init)?;
+
+        let loop_start = self.code_buffer.len();
+
+        self.loop_stack.push(LoopContext {
+            continue_target: loop_start,
+            break_patches: Vec::new(),
+        });
+
+        self.emit_expr(cond)?;
+        let jmp_offset = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        for stmt in body {
+            self.emit_stmt(stmt)?;
+        }
+
+        let continue_target = self.code_buffer.len();
+        self.emit_stmt(update)?;
+
+        self.code_buffer.push(0xA7);
+        let offset = (loop_start as i32 - self.code_buffer.len() as i32 - 3) as i16;
+        self.code_buffer.extend_from_slice(&offset.to_be_bytes());
+
+        let loop_end = self.code_buffer.len();
+        let target = (loop_end as i16 - 2).to_be_bytes();
+        self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&target);
+
+        if let Some(ctx) = self.loop_stack.pop() {
+            for patch_pos in ctx.break_patches {
+                let offset = (loop_end as i32 - patch_pos as i32 + 1) as i16;
+                self.code_buffer[patch_pos..patch_pos + 2].copy_from_slice(&offset.to_be_bytes());
+            }
+        }
 
         Ok(())
     }
@@ -1651,9 +1905,13 @@ impl CodeGen {
         field_name: &str,
     ) -> CompileResult<()> {
         let resolved_class = self.resolve_static_class(class_name);
-
-        let field_idx = self.add_fieldref_constant(&resolved_class, field_name, "I");
-        self.code_buffer.push(0xB2); // getstatic
+        let field_type = self
+            .class_fields
+            .get(field_name)
+            .map(|t| t.to_jvm_descriptor())
+            .unwrap_or_else(|| "I".to_string());
+        let field_idx = self.add_fieldref_constant(&resolved_class, field_name, &field_type);
+        self.code_buffer.push(0xB2);
         self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
 
         Ok(())
@@ -1673,8 +1931,13 @@ impl CodeGen {
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {
         self.emit_expr(obj)?;
         let class_name = self.infer_class_name_from_expr(obj);
-        let field_idx = self.add_fieldref_constant(&class_name, field_name, "I");
-        self.code_buffer.push(0xB4); // getfield
+        let field_type = self
+            .class_fields
+            .get(field_name)
+            .map(|t| t.to_jvm_descriptor())
+            .unwrap_or_else(|| "I".to_string());
+        let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+        self.code_buffer.push(0xB4);
         self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
 
         Ok(())
@@ -1724,10 +1987,10 @@ impl CodeGen {
 
     fn build_method_descriptor_from_args(&self, args: &[Expr]) -> String {
         let mut desc = String::from("(");
-        for _ in args {
-            desc.push('I');
+        for arg in args {
+            desc.push_str(&self.infer_jvm_type_from_expr(arg));
         }
-        desc.push_str(")I");
+        desc.push_str(")V");
         desc
     }
 
@@ -1754,17 +2017,43 @@ impl CodeGen {
             }
             Expr::StringLiteral(_) => VarType::String,
             Expr::BoolLiteral(_) => VarType::Bool,
-            Expr::BinaryOp(_, left, right) => {
+            Expr::BinaryOp(op, left, right) => {
                 let left_ty = self.infer_expr_type(left);
                 let right_ty = self.infer_expr_type(right);
-                if left_ty == VarType::Double || right_ty == VarType::Double {
-                    VarType::Double
-                } else if left_ty == VarType::Float || right_ty == VarType::Float {
-                    VarType::Float
-                } else if left_ty == VarType::Long || right_ty == VarType::Long {
-                    VarType::Long
-                } else {
-                    VarType::Int
+                match op {
+                    BinaryOp::Add => {
+                        if left_ty == VarType::String || right_ty == VarType::String {
+                            VarType::String
+                        } else if left_ty == VarType::Double || right_ty == VarType::Double {
+                            VarType::Double
+                        } else if left_ty == VarType::Float || right_ty == VarType::Float {
+                            VarType::Float
+                        } else if left_ty == VarType::Long || right_ty == VarType::Long {
+                            VarType::Long
+                        } else {
+                            VarType::Int
+                        }
+                    }
+                    BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                        if left_ty == VarType::Double || right_ty == VarType::Double {
+                            VarType::Double
+                        } else if left_ty == VarType::Float || right_ty == VarType::Float {
+                            VarType::Float
+                        } else if left_ty == VarType::Long || right_ty == VarType::Long {
+                            VarType::Long
+                        } else {
+                            VarType::Int
+                        }
+                    }
+                    BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::And
+                    | BinaryOp::Or => VarType::Bool,
+                    BinaryOp::Assign => left_ty,
                 }
             }
             Expr::Variable(name) => self
@@ -1772,6 +2061,8 @@ impl CodeGen {
                 .get(name)
                 .map(|(_, ty)| *ty)
                 .unwrap_or(VarType::Int),
+            Expr::NewObject(_, _) => VarType::Ref,
+            Expr::FieldAccess(_, _) | Expr::StaticFieldAccess(_, _) => VarType::Ref,
             _ => VarType::Ref,
         }
     }
@@ -1779,12 +2070,21 @@ impl CodeGen {
     fn infer_class_name_from_expr(&self, expr: &Expr) -> String {
         match expr {
             Expr::Variable(name) => {
-                if name.starts_with("obj") || name.starts_with("this") {
-                    "Object".to_string()
+                if name == "this" {
+                    self.class_name.clone()
+                } else if let Some(ConstantPoolEntry::Class(utf8_idx)) = self
+                    .constant_pool
+                    .iter()
+                    .find(|e| matches!(e, ConstantPoolEntry::Class(_)))
+                {
+                    self.class_name.clone()
                 } else {
                     "java/lang/Object".to_string()
                 }
             }
+            Expr::NewObject(class_name, _) => class_name.clone(),
+            Expr::FieldAccess(inner, _) => self.infer_class_name_from_expr(inner),
+            Expr::StaticFieldAccess(class_name, _) => self.resolve_static_class(class_name),
             _ => "java/lang/Object".to_string(),
         }
     }

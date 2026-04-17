@@ -641,6 +641,79 @@ impl Parser {
                 self.expect(Token::Semicolon)?;
                 Ok(Stmt::Return(expr))
             }
+            Token::TypeInt8
+            | Token::TypeInt16
+            | Token::TypeInt32
+            | Token::TypeInt64
+            | Token::TypeFloat32
+            | Token::TypeFloat64
+            | Token::TypeBoolean
+            | Token::TypeByte
+            | Token::TypeInt
+            | Token::TypeFloat
+            | Token::Type(_) => {
+                let ty = self.parse_type()?;
+                let name = match &self.current_token {
+                    Token::Variable(n) => n.clone(),
+                    _ => {
+                        return Err(CompileError::ParserError(
+                            "Expected variable name after type".to_string(),
+                        ))
+                    }
+                };
+                self.bump();
+                self.expect(Token::Equal)?;
+                let value = self.parse_expr()?;
+                self.expect(Token::Semicolon)?;
+                Ok(Stmt::TypedAssign(name, ty, value))
+            }
+            Token::SelfRef | Token::Parent => {
+                let class_name = match &self.current_token {
+                    Token::SelfRef => "self",
+                    Token::Parent => "parent",
+                    _ => unreachable!(),
+                };
+                self.bump();
+                self.expect(Token::DoubleColon)?;
+                let field = match &self.current_token {
+                    Token::Identifier(n) => n.clone(),
+                    Token::Variable(n) => n.trim_start_matches('$').to_string(),
+                    _ => {
+                        return Err(CompileError::ParserError(
+                            "Expected static member name".to_string(),
+                        ))
+                    }
+                };
+                self.bump();
+
+                if self.current_token == Token::Equal {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    self.expect(Token::Semicolon)?;
+                    let lhs = Expr::StaticFieldAccess(class_name.to_string(), field);
+                    let assign_expr =
+                        Expr::BinaryOp(BinaryOp::Assign, Box::new(lhs), Box::new(value));
+                    return Ok(Stmt::Expr(assign_expr));
+                }
+
+                if self.current_token == Token::LParen {
+                    self.bump();
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    self.expect(Token::Semicolon)?;
+                    return Ok(Stmt::Expr(Expr::StaticCall(
+                        class_name.to_string(),
+                        field,
+                        args,
+                    )));
+                }
+
+                self.expect(Token::Semicolon)?;
+                Ok(Stmt::Expr(Expr::StaticFieldAccess(
+                    class_name.to_string(),
+                    field,
+                )))
+            }
             Token::Identifier(n) if n == "print" || n == "println" || n == "printf" => {
                 let func = n.clone();
                 self.bump();
@@ -663,7 +736,30 @@ impl Parser {
                 self.expect(Token::LBrace)?;
                 let then = self.parse_block()?;
                 self.expect(Token::RBrace)?;
-                Ok(Stmt::If(cond, then, None))
+
+                let mut elseif_pairs = Vec::new();
+                let mut else_body = None;
+
+                while self.current_token == Token::Else {
+                    self.bump();
+                    if self.current_token == Token::If {
+                        self.bump();
+                        self.expect(Token::LParen)?;
+                        let ei_cond = self.parse_expr()?;
+                        self.expect(Token::RParen)?;
+                        self.expect(Token::LBrace)?;
+                        let ei_body = self.parse_block()?;
+                        self.expect(Token::RBrace)?;
+                        elseif_pairs.push((ei_cond, ei_body));
+                    } else {
+                        self.expect(Token::LBrace)?;
+                        else_body = Some(self.parse_block()?);
+                        self.expect(Token::RBrace)?;
+                        break;
+                    }
+                }
+
+                Ok(Stmt::If(cond, then, elseif_pairs, else_body))
             }
             Token::While => {
                 self.bump();
@@ -674,6 +770,46 @@ impl Parser {
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
                 Ok(Stmt::While(cond, body))
+            }
+            Token::For => {
+                self.bump();
+                self.expect(Token::LParen)?;
+
+                let init = if self.current_token != Token::Semicolon {
+                    self.parse_for_sub_stmt()?
+                } else {
+                    Stmt::Expr(Expr::NullLiteral)
+                };
+                self.expect(Token::Semicolon)?;
+
+                let cond = if self.current_token != Token::RParen {
+                    self.parse_expr()?
+                } else {
+                    Expr::BoolLiteral(true)
+                };
+                self.expect(Token::Semicolon)?;
+
+                let update = if self.current_token != Token::RParen {
+                    self.parse_for_sub_stmt()?
+                } else {
+                    Stmt::Expr(Expr::NullLiteral)
+                };
+                self.expect(Token::RParen)?;
+
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+                Ok(Stmt::For(Box::new(init), cond, Box::new(update), body))
+            }
+            Token::Break => {
+                self.bump();
+                self.expect(Token::Semicolon)?;
+                Ok(Stmt::Break)
+            }
+            Token::Continue => {
+                self.bump();
+                self.expect(Token::Semicolon)?;
+                Ok(Stmt::Continue)
             }
             Token::Variable(_) => {
                 let name = match &self.current_token {
@@ -735,8 +871,17 @@ impl Parser {
             }
             _ => {
                 let e = self.parse_expr()?;
-                self.expect(Token::Semicolon)?;
-                Ok(Stmt::Expr(e))
+                if self.current_token == Token::Equal {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    self.expect(Token::Semicolon)?;
+                    let assign_expr =
+                        Expr::BinaryOp(BinaryOp::Assign, Box::new(e), Box::new(value));
+                    Ok(Stmt::Expr(assign_expr))
+                } else {
+                    self.expect(Token::Semicolon)?;
+                    Ok(Stmt::Expr(e))
+                }
             }
         }
     }
@@ -1078,6 +1223,77 @@ impl Parser {
         }
         Ok(expr)
     }
+
+    fn parse_for_sub_stmt(&mut self) -> CompileResult<Stmt> {
+        match &self.current_token {
+            Token::Variable(_) => {
+                let name = match &self.current_token {
+                    Token::Variable(n) => n.clone(),
+                    _ => return Err(CompileError::ParserError("Expected variable".to_string())),
+                };
+                self.bump();
+
+                if self.current_token == Token::Equal {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    return Ok(Stmt::Assign(name, value));
+                }
+
+                if self.current_token == Token::Arrow || self.current_token == Token::Dot {
+                    let mut expr = Expr::Variable(name);
+                    while self.current_token == Token::Arrow || self.current_token == Token::Dot {
+                        self.bump();
+                        let member = match &self.current_token {
+                            Token::Identifier(n) => n.clone(),
+                            _ => {
+                                return Err(CompileError::ParserError(
+                                    "Expected member".to_string(),
+                                ))
+                            }
+                        };
+                        self.bump();
+
+                        if self.current_token == Token::LParen {
+                            self.bump();
+                            let args = self.parse_args()?;
+                            self.expect(Token::RParen)?;
+                            expr = Expr::MethodCall(Box::new(expr), member, args);
+                        } else {
+                            expr = Expr::FieldAccess(Box::new(expr), member);
+                        }
+                    }
+
+                    if self.current_token == Token::Equal {
+                        self.bump();
+                        let value = self.parse_expr()?;
+                        let assign_expr =
+                            Expr::BinaryOp(BinaryOp::Assign, Box::new(expr), Box::new(value));
+                        return Ok(Stmt::Expr(assign_expr));
+                    }
+
+                    return Ok(Stmt::Expr(expr));
+                }
+
+                Ok(Stmt::Assign(name, Expr::NullLiteral))
+            }
+            _ => {
+                let e = self.parse_expr()?;
+                if self.current_token == Token::Equal {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    let assign_expr =
+                        Expr::BinaryOp(BinaryOp::Assign, Box::new(e), Box::new(value));
+                    Ok(Stmt::Expr(assign_expr))
+                } else {
+                    Ok(Stmt::Expr(e))
+                }
+            }
+        }
+    }
+
+    pub fn parse_stmt_test(&mut self) -> CompileResult<Stmt> {
+        self.parse_stmt()
+    }
 }
 
 /// 解析源代码为 Class AST
@@ -1221,6 +1437,217 @@ mod tests {
         match expr {
             Expr::BinaryOp(BinaryOp::Add, _, _) => {}
             _ => panic!("Expected BinaryOp, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_break_stmt() {
+        let source = "break;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        assert!(matches!(stmt, Stmt::Break));
+    }
+
+    #[test]
+    fn test_continue_stmt() {
+        let source = "continue;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        assert!(matches!(stmt, Stmt::Continue));
+    }
+
+    #[test]
+    fn test_if_with_else() {
+        let source = "if ($x > 0) { $y = 1; } else { $y = 0; }".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::If(_, then_body, elseif_pairs, else_body) => {
+                assert_eq!(then_body.len(), 1);
+                assert!(elseif_pairs.is_empty());
+                assert!(else_body.is_some());
+                assert_eq!(else_body.unwrap().len(), 1);
+            }
+            _ => panic!("Expected If, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_if_with_elseif() {
+        let source =
+            "if ($x > 0) { $y = 1; } else if ($x == 0) { $y = 0; } else { $y = -1; }".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::If(_, then_body, elseif_pairs, else_body) => {
+                assert_eq!(then_body.len(), 1);
+                assert_eq!(elseif_pairs.len(), 1);
+                assert!(else_body.is_some());
+            }
+            _ => panic!("Expected If, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_if_multiple_elseif() {
+        let source =
+            "if ($x == 1) { $y = 10; } else if ($x == 2) { $y = 20; } else if ($x == 3) { $y = 30; } else { $y = 0; }"
+                .to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::If(_, _, elseif_pairs, else_body) => {
+                assert_eq!(elseif_pairs.len(), 2);
+                assert!(else_body.is_some());
+            }
+            _ => panic!("Expected If, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_for_loop() {
+        let source = "for ($i = 0; $i < 10; $i = $i + 1) { println($i); }".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::For(init, cond, update, body) => {
+                assert!(matches!(*init, Stmt::Assign(_, _)));
+                assert!(matches!(*update, Stmt::Assign(_, _)));
+                assert_eq!(body.len(), 1);
+            }
+            _ => panic!("Expected For, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_typed_assign() {
+        let source = "int32 $x = 5;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::TypedAssign(name, ty, _) => {
+                assert_eq!(name, "x");
+                assert_eq!(ty, Type::Int32);
+            }
+            _ => panic!("Expected TypedAssign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_static_field_write_self() {
+        let source = "self::count = 5;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, _)) => match *lhs {
+                Expr::StaticFieldAccess(class, field) => {
+                    assert_eq!(class, "self");
+                    assert_eq!(field, "count");
+                }
+                _ => panic!("Expected StaticFieldAccess lhs"),
+            },
+            _ => panic!("Expected Expr(BinaryOp::Assign), got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_static_field_write_classname() {
+        let source = "MyClass::count = 10;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, _)) => match *lhs {
+                Expr::StaticFieldAccess(class, field) => {
+                    assert_eq!(class, "MyClass");
+                    assert_eq!(field, "count");
+                }
+                _ => panic!("Expected StaticFieldAccess lhs"),
+            },
+            _ => panic!("Expected Expr(BinaryOp::Assign), got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_this_field_access() {
+        let source = "$this->field;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::FieldAccess(obj, field_name)) => {
+                match *obj {
+                    Expr::Variable(name) => assert_eq!(name, "this"),
+                    _ => panic!("Expected Variable 'this'"),
+                }
+                assert_eq!(field_name, "field");
+            }
+            _ => panic!("Expected FieldAccess, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_this_field_assign() {
+        let source = "$this->value = 42;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, rhs)) => {
+                match *lhs {
+                    Expr::FieldAccess(obj, field_name) => {
+                        match *obj {
+                            Expr::Variable(name) => assert_eq!(name, "this"),
+                            _ => panic!("Expected Variable 'this'"),
+                        }
+                        assert_eq!(field_name, "value");
+                    }
+                    _ => panic!("Expected FieldAccess lhs"),
+                }
+                match *rhs {
+                    Expr::IntLiteral(n) => assert_eq!(n, 42),
+                    _ => panic!("Expected IntLiteral rhs"),
+                }
+            }
+            _ => panic!("Expected Assign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_this_method_call() {
+        let source = "$this->doSomething();".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::MethodCall(obj, method_name, args)) => {
+                match *obj {
+                    Expr::Variable(name) => assert_eq!(name, "this"),
+                    _ => panic!("Expected Variable 'this'"),
+                }
+                assert_eq!(method_name, "doSomething");
+                assert_eq!(args.len(), 0);
+            }
+            _ => panic!("Expected MethodCall, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_this_field_chain() {
+        let source = "$this->obj->name;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::FieldAccess(inner, field_name)) => {
+                assert_eq!(field_name, "name");
+                match *inner {
+                    Expr::FieldAccess(obj, inner_field) => {
+                        assert_eq!(inner_field, "obj");
+                        match *obj {
+                            Expr::Variable(name) => assert_eq!(name, "this"),
+                            _ => panic!("Expected Variable 'this'"),
+                        }
+                    }
+                    _ => panic!("Expected nested FieldAccess"),
+                }
+            }
+            _ => panic!("Expected FieldAccess chain, got {:?}", stmt),
         }
     }
 }
