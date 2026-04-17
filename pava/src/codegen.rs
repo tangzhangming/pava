@@ -15,6 +15,15 @@ enum VarType {
     Ref,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JvmCategory {
+    Int,
+    Long,
+    Float,
+    Double,
+    Ref,
+}
+
 pub struct CodeGen {
     constant_pool: Vec<ConstantPoolEntry>,
     code_buffer: Vec<u8>,
@@ -177,6 +186,7 @@ impl CodeGen {
                 self.collect_constants_from_expr(right);
             }
             Expr::UnaryOp(_, inner) => self.collect_constants_from_expr(inner),
+            Expr::Cast(inner, _) => self.collect_constants_from_expr(inner),
             _ => {}
         }
     }
@@ -1205,9 +1215,84 @@ impl CodeGen {
         Ok(())
     }
 
-    fn emit_cast(&mut self, expr: &Expr, _ty: &Type) -> CompileResult<()> {
+    fn emit_cast(&mut self, expr: &Expr, target_type: &Type) -> CompileResult<()> {
         self.emit_expr(expr)?;
+        let src_type = self.infer_expr_type(expr);
+        let src_jvm = self.var_type_to_jvm_category(&src_type);
+        let target_jvm = self.type_to_jvm_category(target_type);
+
+        if src_jvm == target_jvm {
+            match (src_jvm, target_type) {
+                (JvmCategory::Int, Type::Int8) => self.code_buffer.push(0x91),
+                (JvmCategory::Int, Type::Int16) => self.code_buffer.push(0x93),
+                (JvmCategory::Int, Type::Boolean) => {}
+                (JvmCategory::Float, Type::Float32) => {}
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match (src_jvm, target_jvm) {
+            (JvmCategory::Int, JvmCategory::Long) => self.code_buffer.push(0x85),
+            (JvmCategory::Int, JvmCategory::Float) => self.code_buffer.push(0x86),
+            (JvmCategory::Int, JvmCategory::Double) => self.code_buffer.push(0x87),
+            (JvmCategory::Long, JvmCategory::Int) => {
+                self.code_buffer.push(0x88);
+                match target_type {
+                    Type::Int8 => self.code_buffer.push(0x91),
+                    Type::Int16 => self.code_buffer.push(0x93),
+                    _ => {}
+                }
+            }
+            (JvmCategory::Long, JvmCategory::Float) => self.code_buffer.push(0x89),
+            (JvmCategory::Long, JvmCategory::Double) => self.code_buffer.push(0x8A),
+            (JvmCategory::Float, JvmCategory::Int) => {
+                self.code_buffer.push(0x8B);
+                match target_type {
+                    Type::Int8 => self.code_buffer.push(0x91),
+                    Type::Int16 => self.code_buffer.push(0x93),
+                    Type::Int64 => self.code_buffer.push(0x85),
+                    _ => {}
+                }
+            }
+            (JvmCategory::Float, JvmCategory::Long) => self.code_buffer.push(0x8C),
+            (JvmCategory::Float, JvmCategory::Double) => self.code_buffer.push(0x8D),
+            (JvmCategory::Double, JvmCategory::Int) => {
+                self.code_buffer.push(0x8E);
+                match target_type {
+                    Type::Int8 => self.code_buffer.push(0x91),
+                    Type::Int16 => self.code_buffer.push(0x93),
+                    Type::Int64 => self.code_buffer.push(0x85),
+                    _ => {}
+                }
+            }
+            (JvmCategory::Double, JvmCategory::Long) => self.code_buffer.push(0x8F),
+            (JvmCategory::Double, JvmCategory::Float) => self.code_buffer.push(0x90),
+            _ => {}
+        }
+
         Ok(())
+    }
+
+    fn var_type_to_jvm_category(&self, vt: &VarType) -> JvmCategory {
+        match vt {
+            VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => JvmCategory::Int,
+            VarType::Long => JvmCategory::Long,
+            VarType::Float => JvmCategory::Float,
+            VarType::Double => JvmCategory::Double,
+            VarType::String | VarType::Ref => JvmCategory::Ref,
+        }
+    }
+
+    fn type_to_jvm_category(&self, ty: &Type) -> JvmCategory {
+        match ty {
+            Type::Boolean | Type::Int8 | Type::Int16 | Type::Int32 => JvmCategory::Int,
+            Type::Int64 => JvmCategory::Long,
+            Type::Float32 => JvmCategory::Float,
+            Type::Float64 => JvmCategory::Double,
+            Type::String | Type::Object(_) | Type::Nullable(_) | Type::Array(_) => JvmCategory::Ref,
+            Type::Void => JvmCategory::Ref,
+        }
     }
 
     /// 生成闭包表达式代码

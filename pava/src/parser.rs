@@ -858,6 +858,23 @@ impl Parser {
         Ok(expr)
     }
 
+    fn is_type_token(&self) -> bool {
+        matches!(
+            &self.current_token,
+            Token::Type(_)
+                | Token::TypeInt8
+                | Token::TypeInt16
+                | Token::TypeInt32
+                | Token::TypeInt64
+                | Token::TypeFloat32
+                | Token::TypeFloat64
+                | Token::TypeBoolean
+                | Token::TypeByte
+                | Token::TypeInt
+                | Token::TypeFloat
+        )
+    }
+
     fn parse_primary(&mut self) -> CompileResult<Expr> {
         match &self.current_token {
             Token::Variable(n) => {
@@ -907,9 +924,16 @@ impl Parser {
             }
             Token::LParen => {
                 self.bump();
-                let e = self.parse_expr()?;
-                self.expect(Token::RParen)?;
-                Ok(e)
+                if self.is_type_token() {
+                    let target_type = self.parse_type()?;
+                    self.expect(Token::RParen)?;
+                    let expr = self.parse_unary()?;
+                    Ok(Expr::Cast(Box::new(expr), target_type))
+                } else {
+                    let e = self.parse_expr()?;
+                    self.expect(Token::RParen)?;
+                    Ok(e)
+                }
             }
             _ => {
                 let name = match &self.current_token {
@@ -1135,6 +1159,68 @@ mod tests {
                 assert!(!closure.captures[2].is_reference);
             }
             _ => panic!("Expected Closure expression, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_cast_expression_int32_to_int64() {
+        let source = "(int64) $age".to_string();
+        let mut parser = Parser::new(source);
+        let expr = parser.parse_expr_stmt().unwrap();
+        match expr {
+            Expr::Cast(inner, target_type) => {
+                assert_eq!(target_type, Type::Int64);
+                match *inner {
+                    Expr::Variable(name) => assert_eq!(name, "age"),
+                    _ => panic!("Expected Variable inside Cast"),
+                }
+            }
+            _ => panic!("Expected Cast expression, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_cast_expression_int64_to_int32() {
+        let source = "(int32) $bigValue".to_string();
+        let mut parser = Parser::new(source);
+        let expr = parser.parse_expr_stmt().unwrap();
+        match expr {
+            Expr::Cast(inner, target_type) => {
+                assert_eq!(target_type, Type::Int32);
+                match *inner {
+                    Expr::Variable(name) => assert_eq!(name, "bigValue"),
+                    _ => panic!("Expected Variable inside Cast"),
+                }
+            }
+            _ => panic!("Expected Cast expression, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_cast_expression_float64_to_int32() {
+        let source = "(int32) $price".to_string();
+        let mut parser = Parser::new(source);
+        let expr = parser.parse_expr_stmt().unwrap();
+        match expr {
+            Expr::Cast(inner, target_type) => {
+                assert_eq!(target_type, Type::Int32);
+                match *inner {
+                    Expr::Variable(name) => assert_eq!(name, "price"),
+                    _ => panic!("Expected Variable inside Cast"),
+                }
+            }
+            _ => panic!("Expected Cast expression, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_paren_expr_not_cast() {
+        let source = "(1 + 2)".to_string();
+        let mut parser = Parser::new(source);
+        let expr = parser.parse_expr_stmt().unwrap();
+        match expr {
+            Expr::BinaryOp(BinaryOp::Add, _, _) => {}
+            _ => panic!("Expected BinaryOp, got {:?}", expr),
         }
     }
 }
