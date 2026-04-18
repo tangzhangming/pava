@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinaryOp, CaptureVar, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, EnumValue, Expr,
-    PromotedParam, Stmt, Type, UnaryOp,
+    BinaryOp, CaptureVar, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
+    EnumValue, Expr, Import, PromotedParam, Stmt, Type, UnaryOp,
 };
 use crate::error::{CompileError, CompileResult};
 use crate::lexer::{Lexer, Token};
@@ -9,6 +9,8 @@ pub struct Parser {
     lexer: Lexer,
     current_token: Token,
     class_name: String,
+    package: Option<String>,
+    imports: Vec<Import>,
 }
 
 impl Parser {
@@ -17,6 +19,8 @@ impl Parser {
             lexer: Lexer::new(input),
             current_token: Token::Eof,
             class_name: String::new(),
+            package: None,
+            imports: Vec::new(),
         };
         parser.bump();
         parser
@@ -67,6 +71,142 @@ impl Parser {
                 expected, self.current_token
             )))
         }
+    }
+
+    /// 解析完整的限定名（如 java.util.HashMap 或 java/util/HashMap）
+    fn parse_qualified_name(&mut self) -> CompileResult<String> {
+        let mut parts = Vec::new();
+
+        // 第一个标识符
+        match &self.current_token {
+            Token::Identifier(name) => {
+                parts.push(name.clone());
+                self.bump();
+            }
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected identifier in qualified name".to_string(),
+                ))
+            }
+        }
+
+        // 后续的 . 或 / 分隔的部分
+        while self.current_token == Token::Dot {
+            self.bump(); // 吃掉 .
+            match &self.current_token {
+                Token::Identifier(name) => {
+                    parts.push(name.clone());
+                    self.bump();
+                }
+                _ => {
+                    return Err(CompileError::ParserError(
+                        "Expected identifier after '.'".to_string(),
+                    ))
+                }
+            }
+        }
+
+        Ok(parts.join("/"))
+    }
+
+    /// 解析 package 声明
+    fn parse_package(&mut self) -> CompileResult<()> {
+        self.expect(Token::Package)?;
+        self.package = Some(self.parse_qualified_name()?);
+        self.expect(Token::Semicolon)?;
+        Ok(())
+    }
+
+    /// 解析 import 声明
+    fn parse_import(&mut self) -> CompileResult<()> {
+        self.expect(Token::Import)?;
+
+        let mut parts = Vec::new();
+        let mut is_star = false;
+
+        // 第一个标识符
+        match &self.current_token {
+            Token::Identifier(name) => {
+                parts.push(name.clone());
+                self.bump();
+            }
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected identifier in import".to_string(),
+                ))
+            }
+        }
+
+        // 后续的 . 分隔的部分或 *
+        while self.current_token == Token::Dot {
+            self.bump(); // 吃掉 .
+            match &self.current_token {
+                Token::Identifier(name) => {
+                    parts.push(name.clone());
+                    self.bump();
+                }
+                Token::Star => {
+                    is_star = true;
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    return Err(CompileError::ParserError(
+                        "Expected identifier or '*' after '.'".to_string(),
+                    ))
+                }
+            }
+        }
+
+        let path = parts.join("/");
+        self.imports.push(Import {
+            path,
+            is_star,
+            alias: None,
+        });
+
+        self.expect(Token::Semicolon)?;
+        Ok(())
+    }
+
+    /// 解析编译单元（包含 package、imports 和 classes）
+    pub fn parse_compilation_unit(&mut self) -> CompileResult<CompilationUnit> {
+        // 解析可选的 package 声明
+        if self.current_token == Token::Package {
+            self.parse_package()?;
+        }
+
+        // 解析可选的 import 声明列表
+        while self.current_token == Token::Import {
+            self.parse_import()?;
+        }
+
+        // 解析类定义
+        let mut classes = Vec::new();
+        while self.current_token != Token::Eof {
+            // 跳过可能的空白 token
+            if matches!(
+                self.current_token,
+                Token::Class
+                    | Token::Interface
+                    | Token::Enum
+                    | Token::Abstract
+                    | Token::Final
+                    | Token::Open
+            ) {
+                let class = self.parse_class()?;
+                classes.push(class.with_package(&self.package));
+            } else {
+                // 跳过无法识别的 token
+                self.bump();
+            }
+        }
+
+        Ok(CompilationUnit {
+            package: self.package.clone(),
+            imports: self.imports.clone(),
+            classes,
+        })
     }
 
     pub fn parse_class(&mut self) -> CompileResult<Class> {
@@ -346,6 +486,7 @@ impl Parser {
 
         Ok(Class {
             name: self.class_name.clone(),
+            full_name: self.class_name.clone(), // 默认值，后面会被 with_package 覆盖
             extends,
             implements,
             is_abstract,
@@ -743,6 +884,10 @@ impl Parser {
             Token::TypeByte => {
                 self.bump();
                 Ok(Type::Int8)
+            }
+            Token::Void => {
+                self.bump();
+                Ok(Type::Void)
             }
             _ => {
                 self.bump();
@@ -1513,6 +1658,12 @@ impl Parser {
 pub fn parse(source: &str) -> CompileResult<Class> {
     let mut parser = Parser::new(source.to_string());
     parser.parse_class()
+}
+
+/// 解析源代码为编译单元（包含 package、imports 和 classes）
+pub fn parse_compilation_unit(source: &str) -> CompileResult<CompilationUnit> {
+    let mut parser = Parser::new(source.to_string());
+    parser.parse_compilation_unit()
 }
 
 #[cfg(test)]

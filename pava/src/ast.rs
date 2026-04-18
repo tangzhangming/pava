@@ -35,6 +35,20 @@ impl Expr {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub path: String,          // 如 "java/util/HashMap"
+    pub is_star: bool,         // 是否是 import java.util.*;
+    pub alias: Option<String>, // 别名 (可选)
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilationUnit {
+    pub package: Option<String>, // 如 "com/example"
+    pub imports: Vec<Import>,
+    pub classes: Vec<Class>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     String,
@@ -140,6 +154,7 @@ pub struct ClassConst {
 #[derive(Debug, Clone)]
 pub struct Class {
     pub name: String,
+    pub full_name: String, // 包含包名的完整类名，如 "com/example/MyClass"
     pub extends: Option<String>,
     pub implements: Vec<String>,
     pub is_abstract: bool,
@@ -153,6 +168,39 @@ pub struct Class {
     pub constants: Vec<ClassConst>,
     pub constructor: Option<ClassMethod>,
     pub enum_values: Vec<EnumValue>,
+}
+
+impl Class {
+    pub fn with_package(&self, package: &Option<String>) -> Self {
+        let mut new_class = self.clone();
+        new_class.full_name = match package {
+            Some(pkg) => format!("{}/{}", pkg, self.name),
+            None => self.name.clone(),
+        };
+        new_class
+    }
+}
+
+impl Default for Class {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            full_name: String::new(),
+            extends: None,
+            implements: Vec::new(),
+            is_abstract: false,
+            is_final: false,
+            is_open: false,
+            is_interface: false,
+            is_enum: false,
+            enum_backed_type: None,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            constants: Vec::new(),
+            constructor: None,
+            enum_values: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

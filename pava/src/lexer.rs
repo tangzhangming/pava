@@ -41,6 +41,8 @@ pub enum Token {
     Case,
     Open,
     Internal, // 模块内可见性修饰符
+    Package,
+    Import,
 
     // Types
     Type(String),
@@ -453,6 +455,8 @@ impl Lexer {
             "case" => Token::Case,
             "open" => Token::Open,
             "internal" => Token::Internal,
+            "package" => Token::Package,
+            "import" => Token::Import,
             "instanceof" => Token::Instanceof,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,

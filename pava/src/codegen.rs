@@ -13,6 +13,7 @@ enum VarType {
     String,
     Bool,
     Ref,
+    ObjectRef(usize), // 存储常量池中类名的索引
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,6 +38,7 @@ pub struct CodeGen {
     local_vars: HashMap<String, (u16, VarType)>,
     max_locals: u16,
     max_stack: u16,
+    current_stack: u16, // 当前栈深度
     collected_integers: Vec<i32>,
     collected_longs: Vec<i64>,
     collected_floats: Vec<f32>,
@@ -55,6 +57,7 @@ pub struct CodeGen {
     super_class_idx: u16,
     class_name: String,
     parent_class_name: Option<String>,
+    imports: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +84,18 @@ const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_ENUM: u16 = 0x4000;
 
 impl CodeGen {
+    /// 更新最大栈深度
+    fn update_max_stack(&mut self, delta: i16) {
+        if delta > 0 {
+            self.current_stack = self.current_stack.saturating_add(delta as u16);
+            if self.current_stack > self.max_stack {
+                self.max_stack = self.current_stack;
+            }
+        } else {
+            self.current_stack = self.current_stack.saturating_sub((-delta) as u16);
+        }
+    }
+
     pub fn new(_class: Class) -> Self {
         CodeGen {
             loop_stack: Vec::new(),
@@ -90,6 +105,7 @@ impl CodeGen {
             local_vars: HashMap::new(),
             max_locals: 1,
             max_stack: 1,
+            current_stack: 0,
             collected_integers: Vec::new(),
             collected_longs: Vec::new(),
             collected_floats: Vec::new(),
@@ -108,6 +124,7 @@ impl CodeGen {
             super_class_idx: 0,
             class_name: String::new(),
             parent_class_name: None,
+            imports: Vec::new(),
         }
     }
 
@@ -268,12 +285,10 @@ impl CodeGen {
             self.double_constants.insert(double_val.to_bits(), idx);
         }
 
-        let _empty = add(ConstantPoolEntry::Utf8("".to_string()));
-
         let obj_utf8 = add(ConstantPoolEntry::Utf8("java/lang/Object".to_string()));
         let obj_class = add(ConstantPoolEntry::Class(obj_utf8));
 
-        let class_utf8 = add(ConstantPoolEntry::Utf8(class.name.clone()));
+        let class_utf8 = add(ConstantPoolEntry::Utf8(class.full_name.clone()));
         let class_class = add(ConstantPoolEntry::Class(class_utf8));
         self.class_idx = class_class;
 
@@ -355,8 +370,39 @@ impl CodeGen {
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
-        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x31]);
+        // Java 21 = major version 65 = 0x0041
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x41]);
 
+        // 先收集所有方法，这可能会添加更多常量到常量池
+        let mut method_bytes = Vec::new();
+        let has_clinit = !class.constants.is_empty() || class.is_enum;
+
+        // 生成构造函数
+        if class.is_enum {
+            self.emit_enum_init_method(&mut method_bytes, class)?;
+        } else if class.constructor.is_some() {
+            self.emit_constructor_method(&mut method_bytes, class)?;
+        } else {
+            self.emit_init_method(&mut method_bytes);
+        }
+
+        // 生成 clinit 方法
+        if has_clinit {
+            self.emit_clinit_method(&mut method_bytes, class)?;
+        }
+
+        // 生成其他方法（这可能会添加常量到常量池）
+        for method in &class.methods {
+            if method.name == "main" {
+                self.emit_main_method(&mut method_bytes, class)?;
+            } else if method.is_abstract {
+                self.emit_abstract_method(&mut method_bytes, method)?;
+            } else {
+                self.emit_method(&mut method_bytes, method)?;
+            }
+        }
+
+        // 现在常量池已经完整，计算并输出
         let cp_count = self.constant_pool.iter().fold(1, |acc, entry| {
             acc + match entry {
                 ConstantPoolEntry::Long(_) | ConstantPoolEntry::Double(_) => 2,
@@ -422,31 +468,11 @@ impl CodeGen {
             }
         }
 
-        let has_clinit = !class.constants.is_empty() || class.is_enum;
         let method_count = class.methods.len() as u16 + 1 + if has_clinit { 1 } else { 0 };
         bytes.extend_from_slice(&method_count.to_be_bytes());
 
-        if class.is_enum {
-            self.emit_enum_init_method(&mut bytes, class)?;
-        } else if class.constructor.is_some() {
-            self.emit_constructor_method(&mut bytes, class)?;
-        } else {
-            self.emit_init_method(&mut bytes);
-        }
-
-        if has_clinit {
-            self.emit_clinit_method(&mut bytes, class)?;
-        }
-
-        for method in &class.methods {
-            if method.name == "main" {
-                self.emit_main_method(&mut bytes, class)?;
-            } else if method.is_abstract {
-                self.emit_abstract_method(&mut bytes, method)?;
-            } else {
-                self.emit_method(&mut bytes, method)?;
-            }
-        }
+        // 添加所有方法字节
+        bytes.extend_from_slice(&method_bytes);
 
         bytes.extend_from_slice(&0u16.to_be_bytes());
 
@@ -727,9 +753,24 @@ impl CodeGen {
         let code_idx = self.find_utf8_index("Code").unwrap_or(10);
         let code_attr_len = 12 + self.code_buffer.len() as u32;
 
+        // 估算 max_stack：基于字节码中特定指令的数量
+        // 这是一个简化的估算方法
+        let mut new_count = 0u16; // new 指令数量
+        let mut ldc_count = 0u16; // ldc 指令数量
+        for byte in &self.code_buffer {
+            match byte {
+                0xbb => new_count += 1,        // new
+                0x12 | 0x13 => ldc_count += 1, // ldc/ldc_w
+                _ => {}
+            }
+        }
+        // 基础栈深度 + new/dup 对 + ldc
+        let estimated_stack = 2 + (new_count * 2) + ldc_count;
+        let estimated_stack = estimated_stack.min(64).max(2);
+
         bytes.extend_from_slice(&code_idx.to_be_bytes());
         bytes.extend_from_slice(&code_attr_len.to_be_bytes());
-        bytes.extend_from_slice(&5u16.to_be_bytes());
+        bytes.extend_from_slice(&estimated_stack.to_be_bytes());
         bytes.extend_from_slice(&self.max_locals.to_be_bytes());
 
         let code_len = self.code_buffer.len() as u32;
@@ -967,9 +1008,9 @@ impl CodeGen {
     }
 
     fn emit_main_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
-        let main_idx = self.find_utf8_index("main").unwrap_or(50);
-        let main_desc_idx = self.find_utf8_index("([Ljava/lang/String;)V").unwrap_or(51);
-        let code_idx = self.find_utf8_index("Code").unwrap_or(10);
+        let main_idx = self.add_utf8_constant("main");
+        let main_desc_idx = self.add_utf8_constant("([Ljava/lang/String;)V");
+        let code_idx = self.add_utf8_constant("Code");
 
         bytes.extend_from_slice(&(ACC_PUBLIC | ACC_STATIC).to_be_bytes());
         bytes.extend_from_slice(&main_idx.to_be_bytes());
@@ -1135,6 +1176,7 @@ impl CodeGen {
             }
             _ => self.emit_long(n)?,
         }
+        self.update_max_stack(1);
         Ok(())
     }
 
@@ -1177,8 +1219,10 @@ impl CodeGen {
     }
 
     fn emit_string(&mut self, s: &str) -> CompileResult<()> {
-        let idx = self.add_utf8_constant(s);
-        self.emit_ldc(idx);
+        let utf8_idx = self.add_utf8_constant(s);
+        // 创建 String 常量池条目
+        let string_idx = self.add_string_constant(utf8_idx);
+        self.emit_ldc(string_idx);
         Ok(())
     }
 
@@ -1250,7 +1294,7 @@ impl CodeGen {
                         self.code_buffer.push(idx as u8);
                     }
                 },
-                VarType::String | VarType::Ref => match idx {
+                VarType::String | VarType::Ref | VarType::ObjectRef(_) => match idx {
                     0 => self.code_buffer.push(0x2A),
                     1 => self.code_buffer.push(0x2B),
                     2 => self.code_buffer.push(0x2C),
@@ -1290,10 +1334,46 @@ impl CodeGen {
                     self.code_buffer.push(var_index as u8);
                 }
             },
-            _ => {
-                self.code_buffer.push(0x3A);
-                self.code_buffer.push(var_index as u8);
-            }
+            VarType::Long => match var_index {
+                0 => self.code_buffer.push(0x3F),
+                1 => self.code_buffer.push(0x40),
+                2 => self.code_buffer.push(0x41),
+                3 => self.code_buffer.push(0x42),
+                _ => {
+                    self.code_buffer.push(0x37);
+                    self.code_buffer.push(var_index as u8);
+                }
+            },
+            VarType::Float => match var_index {
+                0 => self.code_buffer.push(0x43),
+                1 => self.code_buffer.push(0x44),
+                2 => self.code_buffer.push(0x45),
+                3 => self.code_buffer.push(0x46),
+                _ => {
+                    self.code_buffer.push(0x38);
+                    self.code_buffer.push(var_index as u8);
+                }
+            },
+            VarType::Double => match var_index {
+                0 => self.code_buffer.push(0x47),
+                1 => self.code_buffer.push(0x48),
+                2 => self.code_buffer.push(0x49),
+                3 => self.code_buffer.push(0x4A),
+                _ => {
+                    self.code_buffer.push(0x39);
+                    self.code_buffer.push(var_index as u8);
+                }
+            },
+            VarType::String | VarType::Ref | VarType::ObjectRef(_) => match var_index {
+                0 => self.code_buffer.push(0x4B),
+                1 => self.code_buffer.push(0x4C),
+                2 => self.code_buffer.push(0x4D),
+                3 => self.code_buffer.push(0x4E),
+                _ => {
+                    self.code_buffer.push(0x3A);
+                    self.code_buffer.push(var_index as u8);
+                }
+            },
         }
         Ok(())
     }
@@ -1353,8 +1433,26 @@ impl CodeGen {
                 self.code_buffer.push(0x80);
             }
             BinaryOp::Assign => {
-                self.emit_expr(right)?;
-                self.emit_store_field(left)?;
+                // 检查是否是变量赋值
+                let left_expr: &Expr = &*left;
+                let right_expr: &Expr = &*right;
+
+                if let Expr::Variable(name) = left_expr {
+                    let name = name.clone();
+                    // 对于 NewObject，存储具体的类名
+                    let var_type = if let Expr::NewObject(class_name, _) = right_expr {
+                        let resolved_name = self.resolve_class_name(class_name);
+                        let class_idx = self.add_class_constant(&resolved_name);
+                        VarType::ObjectRef(class_idx as usize)
+                    } else {
+                        self.infer_expr_type(right_expr)
+                    };
+                    self.emit_expr(right)?;
+                    self.emit_store_var(&name, var_type)?;
+                } else {
+                    self.emit_expr(right)?;
+                    self.emit_store_field(left)?;
+                }
             }
             BinaryOp::AddAssign
             | BinaryOp::SubAssign
@@ -1521,7 +1619,7 @@ impl CodeGen {
             VarType::Long => JvmCategory::Long,
             VarType::Float => JvmCategory::Float,
             VarType::Double => JvmCategory::Double,
-            VarType::String | VarType::Ref => JvmCategory::Ref,
+            VarType::String | VarType::Ref | VarType::ObjectRef(_) => JvmCategory::Ref,
         }
     }
 
@@ -2194,8 +2292,18 @@ impl CodeGen {
 
     fn emit_assign(&mut self, name: &str, expr: &Expr) -> CompileResult<()> {
         let ty = self.infer_expr_type(expr);
+
+        // 对于 NewObject，存储具体的类名
+        let var_type = if let Expr::NewObject(class_name, _) = expr {
+            let resolved_name = self.resolve_class_name(class_name);
+            let class_idx = self.add_class_constant(&resolved_name);
+            VarType::ObjectRef(class_idx as usize)
+        } else {
+            ty
+        };
+
         self.emit_expr(expr)?;
-        self.emit_store_var(name, ty)?;
+        self.emit_store_var(name, var_type)?;
         Ok(())
     }
 
@@ -2210,9 +2318,37 @@ impl CodeGen {
             self.emit_expr(arg)?;
         }
 
-        let class_name = self.infer_class_name_from_expr(obj);
+        // 尝试从变量类型推断类名
+        let resolved_name = match obj {
+            Expr::Variable(name) => {
+                if let Some((_, ty)) = self.local_vars.get(name) {
+                    if let VarType::ObjectRef(class_idx) = ty {
+                        // 从常量池获取类名
+                        if let Some(ConstantPoolEntry::Class(utf8_idx)) =
+                            self.constant_pool.get(*class_idx - 1)
+                        {
+                            if let Some(ConstantPoolEntry::Utf8(class_name)) =
+                                self.constant_pool.get(*utf8_idx as usize - 1)
+                            {
+                                class_name.clone()
+                            } else {
+                                self.resolve_class_name(name)
+                            }
+                        } else {
+                            self.resolve_class_name(name)
+                        }
+                    } else {
+                        self.resolve_class_name(name)
+                    }
+                } else {
+                    self.infer_class_name_from_expr(obj)
+                }
+            }
+            _ => self.infer_class_name_from_expr(obj),
+        };
+
         let descriptor = self.build_method_descriptor_from_args(args);
-        let method_idx = self.add_methodref_constant(&class_name, method_name, &descriptor);
+        let method_idx = self.add_methodref_constant(&resolved_name, method_name, &descriptor);
         self.code_buffer.push(0xB6);
         self.code_buffer
             .extend_from_slice(&method_idx.to_be_bytes());
@@ -2282,6 +2418,35 @@ impl CodeGen {
         }
     }
 
+    /// 解析类名，考虑 import 和当前 package
+    fn resolve_class_name(&self, class_name: &str) -> String {
+        // 先检查是否是已知的 Java 类
+        if class_name.starts_with("java/") || class_name.starts_with("javax/") {
+            return class_name.to_string();
+        }
+
+        // 检查 import 列表
+        for import in &self.imports {
+            // 提取 import 的最后一部分
+            if let Some(pos) = import.rfind('/') {
+                let simple_name = &import[pos + 1..];
+                if simple_name == class_name {
+                    return import.clone();
+                }
+            } else if import == class_name {
+                return import.clone();
+            }
+        }
+
+        // 检查是否是当前 package 中的类
+        if let Some(pkg) = self.class_name.rfind('/') {
+            return format!("{}/{}", &self.class_name[..pkg], class_name);
+        }
+
+        // 默认返回原始名称
+        class_name.to_string()
+    }
+
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {
         self.emit_expr(obj)?;
         let class_name = self.infer_class_name_from_expr(obj);
@@ -2298,7 +2463,8 @@ impl CodeGen {
     }
 
     fn emit_new_object(&mut self, class_name: &str, args: &[Expr]) -> CompileResult<()> {
-        let class_idx = self.add_class_constant(class_name);
+        let resolved_name = self.resolve_class_name(class_name);
+        let class_idx = self.add_class_constant(&resolved_name);
         self.code_buffer.push(0xBB); // new
         self.code_buffer.extend_from_slice(&class_idx.to_be_bytes());
         self.code_buffer.push(0x59); // dup
@@ -2308,7 +2474,7 @@ impl CodeGen {
         }
 
         let init_descriptor = self.build_constructor_descriptor_from_args(args);
-        let init_idx = self.add_methodref_constant(class_name, "<init>", &init_descriptor);
+        let init_idx = self.add_methodref_constant(&resolved_name, "<init>", &init_descriptor);
         self.code_buffer.push(0xB7); // invokespecial
         self.code_buffer.extend_from_slice(&init_idx.to_be_bytes());
 
@@ -2334,7 +2500,7 @@ impl CodeGen {
             VarType::Double => "D",
             VarType::Bool => "Z",
             VarType::String => "Ljava/lang/String;",
-            VarType::Ref => "Ljava/lang/Object;",
+            VarType::Ref | VarType::ObjectRef(_) => "Ljava/lang/Object;",
         }
         .to_string()
     }
@@ -2654,4 +2820,24 @@ pub fn compile(source: &str) -> CompileResult<Vec<u8>> {
     let ast = parser.parse_class()?;
     let mut codegen = CodeGen::new(ast.clone());
     codegen.generate(ast)
+}
+
+/// 编译编译单元（支持 package 和 imports）
+pub fn compile_unit(unit: &CompilationUnit) -> CompileResult<Vec<(String, Vec<u8>)>> {
+    let mut results = Vec::new();
+
+    for class in &unit.classes {
+        let mut codegen = CodeGen::new(class.clone());
+        // 存储 import 的类路径
+        codegen.imports = unit
+            .imports
+            .iter()
+            .filter(|imp| !imp.is_star)
+            .map(|imp| imp.path.clone())
+            .collect();
+        let bytecode = codegen.generate(class.clone())?;
+        results.push((class.full_name.clone(), bytecode));
+    }
+
+    Ok(results)
 }
