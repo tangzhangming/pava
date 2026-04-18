@@ -157,12 +157,22 @@ pub fn infer_expr_type(expr: &Expr) -> Type {
                 | crate::ast::BinaryOp::Ne => Type::Boolean,
                 crate::ast::BinaryOp::And | crate::ast::BinaryOp::Or => Type::Boolean,
                 crate::ast::BinaryOp::Assign => infer_expr_type(right),
+                crate::ast::BinaryOp::AddAssign
+                | crate::ast::BinaryOp::SubAssign
+                | crate::ast::BinaryOp::MulAssign
+                | crate::ast::BinaryOp::DivAssign
+                | crate::ast::BinaryOp::ModAssign => infer_expr_type(left),
             }
         }
         Expr::UnaryOp(op, inner) => match op {
             crate::ast::UnaryOp::Neg => infer_expr_type(inner),
             crate::ast::UnaryOp::Not => Type::Boolean,
+            crate::ast::UnaryOp::PreIncrement
+            | crate::ast::UnaryOp::PostIncrement
+            | crate::ast::UnaryOp::PreDecrement
+            | crate::ast::UnaryOp::PostDecrement => infer_expr_type(inner),
         },
+        Expr::InstanceOf(_, _) => Type::Boolean,
         Expr::Cast(_, target_type) => target_type.clone(),
         Expr::NewObject(class_name, _) => Type::Object(class_name.clone()),
         _ => Type::String,

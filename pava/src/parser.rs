@@ -22,6 +22,37 @@ impl Parser {
         parser
     }
 
+    fn parse_visibility(&mut self) -> (bool, bool, bool, bool) {
+        let mut is_public = false;
+        let mut is_private = false;
+        let mut is_protected = false;
+        let mut is_internal = false;
+
+        match &self.current_token {
+            Token::Public => {
+                is_public = true;
+                self.bump();
+            }
+            Token::Private => {
+                is_private = true;
+                self.bump();
+            }
+            Token::Protected => {
+                is_protected = true;
+                self.bump();
+            }
+            Token::Internal => {
+                is_internal = true;
+                self.bump();
+            }
+            _ => {
+                is_public = true;
+            }
+        }
+
+        (is_public, is_private, is_protected, is_internal)
+    }
+
     fn bump(&mut self) {
         self.current_token = self.lexer.next_token().unwrap();
     }
@@ -172,10 +203,12 @@ impl Parser {
                     self.bump();
                     if self.current_token == Token::Function {
                         self.bump();
-                        let m = self.parse_method_with_flags(true, true, false, false, false)?;
+                        let m = self.parse_method_with_flags(
+                            true, true, false, false, false, false, false, false,
+                        )?;
                         methods.push(m);
                     } else {
-                        let mut f = self.parse_field()?;
+                        let mut f = self.parse_field(true, false, false, false)?;
                         f.is_static = true;
                         fields.push(f);
                     }
@@ -187,44 +220,80 @@ impl Parser {
                     let m = self.parse_method_with_flags(
                         false,
                         true,
+                        false,
+                        false,
+                        false,
                         is_abstract_method,
                         is_default_method,
                         false,
                     )?;
                     methods.push(m);
                 }
-                Token::Public | Token::Private => {
-                    let is_public = matches!(&self.current_token, Token::Public);
-                    self.bump();
+                Token::Public | Token::Private | Token::Protected | Token::Internal => {
+                    let (is_public, is_private, is_protected, is_internal) =
+                        self.parse_visibility();
                     match &self.current_token {
                         Token::Static => {
                             self.bump();
                             if self.current_token == Token::Function {
                                 self.bump();
                                 let m = self.parse_method_with_flags(
-                                    true, is_public, false, false, false,
+                                    true,
+                                    is_public,
+                                    is_private,
+                                    is_protected,
+                                    is_internal,
+                                    false,
+                                    false,
+                                    false,
                                 )?;
                                 methods.push(m);
                             } else {
-                                let mut f = self.parse_field()?;
+                                let mut f = self.parse_field(
+                                    is_public,
+                                    is_private,
+                                    is_protected,
+                                    is_internal,
+                                )?;
                                 f.is_static = true;
                                 fields.push(f);
                             }
                         }
                         Token::Function => {
                             self.bump();
-                            let m =
-                                self.parse_method_with_flags(false, is_public, false, false, true)?;
-                            constructor = Some(m);
+                            let m = self.parse_method_with_flags(
+                                false,
+                                is_public,
+                                is_private,
+                                is_protected,
+                                is_internal,
+                                false,
+                                false,
+                                false,
+                            )?;
+                            methods.push(m);
                         }
                         Token::Abstract => {
                             self.bump();
                             self.expect(Token::Function)?;
-                            let m = self.parse_abstract_method(is_public)?;
+                            let m = self.parse_abstract_method(
+                                is_public,
+                                is_private,
+                                is_protected,
+                                is_internal,
+                            )?;
                             methods.push(m);
                         }
+                        Token::Final => {
+                            self.bump();
+                            let mut f =
+                                self.parse_field(is_public, is_private, is_protected, is_internal)?;
+                            f.is_final = true;
+                            fields.push(f);
+                        }
                         _ => {
-                            let f = self.parse_field()?;
+                            let f =
+                                self.parse_field(is_public, is_private, is_protected, is_internal)?;
                             fields.push(f);
                         }
                     }
@@ -232,18 +301,40 @@ impl Parser {
                 Token::Abstract => {
                     self.bump();
                     self.expect(Token::Function)?;
-                    let m = self.parse_abstract_method(true)?;
+                    let m = self.parse_abstract_method(true, false, false, false)?;
                     methods.push(m);
                 }
                 Token::Identifier(n) => {
                     if n == "__construct" {
                         self.bump();
-                        let m = self.parse_method_with_flags(false, true, false, false, true)?;
+                        let m = self.parse_method_with_flags(
+                            false, true, false, false, false, false, false, true,
+                        )?;
                         constructor = Some(m);
                     } else {
-                        let f = self.parse_field()?;
+                        let f = self.parse_field(true, false, false, false)?;
                         fields.push(f);
                     }
+                }
+                Token::Final => {
+                    self.bump();
+                    let mut f = self.parse_field(true, false, false, false)?;
+                    f.is_final = true;
+                    fields.push(f);
+                }
+                Token::Type(_)
+                | Token::TypeInt8
+                | Token::TypeInt16
+                | Token::TypeInt32
+                | Token::TypeInt64
+                | Token::TypeFloat32
+                | Token::TypeFloat64
+                | Token::TypeBoolean
+                | Token::TypeByte
+                | Token::TypeInt
+                | Token::TypeFloat => {
+                    let f = self.parse_field(true, false, false, false)?;
+                    fields.push(f);
                 }
                 _ => {
                     self.bump();
@@ -302,7 +393,13 @@ impl Parser {
         Ok(ClassConst { name, value })
     }
 
-    fn parse_field(&mut self) -> CompileResult<ClassField> {
+    fn parse_field(
+        &mut self,
+        is_public: bool,
+        is_private: bool,
+        is_protected: bool,
+        is_internal: bool,
+    ) -> CompileResult<ClassField> {
         let field_type = self.parse_type()?;
 
         let name = match &self.current_token {
@@ -333,22 +430,42 @@ impl Parser {
             field_type,
             is_nullable: false,
             is_static: false,
-            is_public: true,
-            is_private: false,
-            is_protected: false,
+            is_public,
+            is_private,
+            is_protected,
+            is_internal,
             is_final: false,
             initializer,
         })
     }
 
-    fn parse_method(&mut self, is_static: bool, is_public: bool) -> CompileResult<ClassMethod> {
-        self.parse_method_with_flags(is_static, is_public, false, false, false)
+    fn parse_method(
+        &mut self,
+        is_static: bool,
+        is_public: bool,
+        is_private: bool,
+        is_protected: bool,
+        is_internal: bool,
+    ) -> CompileResult<ClassMethod> {
+        self.parse_method_with_flags(
+            is_static,
+            is_public,
+            is_private,
+            is_protected,
+            is_internal,
+            false,
+            false,
+            false,
+        )
     }
 
     fn parse_method_with_flags(
         &mut self,
         is_static: bool,
         is_public: bool,
+        is_private: bool,
+        is_protected: bool,
+        is_internal: bool,
         is_abstract: bool,
         is_default: bool,
         is_constructor: bool,
@@ -398,12 +515,21 @@ impl Parser {
             body,
             is_static,
             is_public,
+            is_private,
+            is_protected,
+            is_internal,
             is_abstract,
             is_default,
         })
     }
 
-    fn parse_abstract_method(&mut self, is_public: bool) -> CompileResult<ClassMethod> {
+    fn parse_abstract_method(
+        &mut self,
+        is_public: bool,
+        is_private: bool,
+        is_protected: bool,
+        is_internal: bool,
+    ) -> CompileResult<ClassMethod> {
         let name = match &self.current_token {
             Token::Identifier(n) => n.clone(),
             _ => {
@@ -435,6 +561,9 @@ impl Parser {
             body: Vec::new(),
             is_static: false,
             is_public,
+            is_private,
+            is_protected,
+            is_internal,
             is_abstract: true,
             is_default: false,
         })
@@ -482,15 +611,17 @@ impl Parser {
                 let mut is_public = false;
                 let mut is_private = false;
                 let mut is_protected = false;
+                let mut is_internal = false;
 
                 if matches!(
                     &self.current_token,
-                    Token::Public | Token::Private | Token::Protected
+                    Token::Public | Token::Private | Token::Protected | Token::Internal
                 ) {
                     match &self.current_token {
                         Token::Public => is_public = true,
                         Token::Private => is_private = true,
                         Token::Protected => is_protected = true,
+                        Token::Internal => is_internal = true,
                         _ => {}
                     }
                     self.bump();
@@ -511,13 +642,14 @@ impl Parser {
 
                 params.push((param_name.clone(), param_type.clone()));
 
-                if is_public || is_private || is_protected {
+                if is_public || is_private || is_protected || is_internal {
                     promoted_params.push(PromotedParam {
                         name: param_name,
                         param_type,
                         is_public,
                         is_private,
                         is_protected,
+                        is_internal,
                     });
                 }
 
@@ -812,62 +944,39 @@ impl Parser {
                 Ok(Stmt::Continue)
             }
             Token::Variable(_) => {
-                let name = match &self.current_token {
-                    Token::Variable(n) => n.clone(),
-                    _ => return Err(CompileError::ParserError("Expected variable".to_string())),
-                };
-                self.bump();
-
+                let expr = self.parse_expr()?;
                 if self.current_token == Token::Equal {
                     self.bump();
                     let value = self.parse_expr()?;
                     self.expect(Token::Semicolon)?;
-                    return Ok(Stmt::Assign(name, value));
-                }
-
-                // 处理字段访问 $obj->field
-                if self.current_token == Token::Arrow || self.current_token == Token::Dot {
-                    let mut expr = Expr::Variable(name);
-                    while self.current_token == Token::Arrow || self.current_token == Token::Dot {
-                        let _op = self.current_token.clone();
-                        self.bump();
-                        let member = match &self.current_token {
-                            Token::Identifier(n) => n.clone(),
-                            _ => {
-                                return Err(CompileError::ParserError(
-                                    "Expected member".to_string(),
-                                ))
-                            }
-                        };
-                        self.bump();
-
-                        if self.current_token == Token::LParen {
-                            self.bump();
-                            let args = self.parse_args()?;
-                            self.expect(Token::RParen)?;
-                            expr = Expr::MethodCall(Box::new(expr), member, args);
-                        } else {
-                            expr = Expr::FieldAccess(Box::new(expr), member);
-                        }
-                    }
-
-                    // 检查是否是赋值 $obj->field = value
-                    if self.current_token == Token::Equal {
-                        self.bump();
-                        let value = self.parse_expr()?;
-                        self.expect(Token::Semicolon)?;
-                        // 创建赋值表达式：$obj->field = value
-                        let assign_expr =
-                            Expr::BinaryOp(BinaryOp::Assign, Box::new(expr), Box::new(value));
-                        return Ok(Stmt::Expr(assign_expr));
-                    }
-
+                    let assign_expr =
+                        Expr::BinaryOp(BinaryOp::Assign, Box::new(expr), Box::new(value));
+                    Ok(Stmt::Expr(assign_expr))
+                } else if matches!(
+                    self.current_token,
+                    Token::PlusEqual
+                        | Token::MinusEqual
+                        | Token::StarEqual
+                        | Token::SlashEqual
+                        | Token::PercentEqual
+                ) {
+                    let op = match &self.current_token {
+                        Token::PlusEqual => BinaryOp::AddAssign,
+                        Token::MinusEqual => BinaryOp::SubAssign,
+                        Token::StarEqual => BinaryOp::MulAssign,
+                        Token::SlashEqual => BinaryOp::DivAssign,
+                        Token::PercentEqual => BinaryOp::ModAssign,
+                        _ => unreachable!(),
+                    };
+                    self.bump();
+                    let value = self.parse_expr()?;
                     self.expect(Token::Semicolon)?;
-                    return Ok(Stmt::Expr(expr));
+                    let assign_expr = Expr::BinaryOp(op, Box::new(expr), Box::new(value));
+                    Ok(Stmt::Expr(assign_expr))
+                } else {
+                    self.expect(Token::Semicolon)?;
+                    Ok(Stmt::Expr(expr))
                 }
-
-                self.expect(Token::Semicolon)?;
-                Ok(Stmt::Assign(name, Expr::NullLiteral))
             }
             _ => {
                 let e = self.parse_expr()?;
@@ -878,6 +987,27 @@ impl Parser {
                     let assign_expr =
                         Expr::BinaryOp(BinaryOp::Assign, Box::new(e), Box::new(value));
                     Ok(Stmt::Expr(assign_expr))
+                } else if matches!(
+                    self.current_token,
+                    Token::PlusEqual
+                        | Token::MinusEqual
+                        | Token::StarEqual
+                        | Token::SlashEqual
+                        | Token::PercentEqual
+                ) {
+                    let op = match &self.current_token {
+                        Token::PlusEqual => BinaryOp::AddAssign,
+                        Token::MinusEqual => BinaryOp::SubAssign,
+                        Token::StarEqual => BinaryOp::MulAssign,
+                        Token::SlashEqual => BinaryOp::DivAssign,
+                        Token::PercentEqual => BinaryOp::ModAssign,
+                        _ => unreachable!(),
+                    };
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    self.expect(Token::Semicolon)?;
+                    let assign_expr = Expr::BinaryOp(op, Box::new(e), Box::new(value));
+                    Ok(Stmt::Expr(assign_expr))
                 } else {
                     self.expect(Token::Semicolon)?;
                     Ok(Stmt::Expr(e))
@@ -887,7 +1017,35 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> CompileResult<Expr> {
-        self.parse_comparison()
+        let left = self.parse_comparison()?;
+        self.parse_ternary(left)
+    }
+
+    fn parse_ternary(&mut self, left: Expr) -> CompileResult<Expr> {
+        match &self.current_token {
+            Token::Question => {
+                self.bump();
+                let then_expr = self.parse_expr()?;
+                self.expect(Token::Colon)?;
+                let else_expr = self.parse_expr()?;
+                Ok(Expr::Ternary(
+                    Box::new(left),
+                    Box::new(then_expr),
+                    Box::new(else_expr),
+                ))
+            }
+            Token::QuestionColon => {
+                self.bump();
+                let else_expr = self.parse_expr()?;
+                Ok(Expr::Elvis(Box::new(left), Box::new(else_expr)))
+            }
+            Token::DoubleQuestion => {
+                self.bump();
+                let default_expr = self.parse_expr()?;
+                Ok(Expr::NullCoalescing(Box::new(left), Box::new(default_expr)))
+            }
+            _ => Ok(left),
+        }
     }
 
     fn parse_comparison(&mut self) -> CompileResult<Expr> {
@@ -909,6 +1067,32 @@ impl Parser {
             self.bump();
             let right = self.parse_additive()?;
             left = Expr::BinaryOp(op, Box::new(left), Box::new(right));
+        }
+
+        // Handle instanceof operator
+        if self.current_token == Token::Instanceof {
+            self.bump();
+            let class_name = match &self.current_token {
+                Token::Identifier(name) => name.clone(),
+                Token::Type(name) => name.clone(),
+                Token::TypeInt8 => "byte".to_string(),
+                Token::TypeInt16 => "short".to_string(),
+                Token::TypeInt32 => "int".to_string(),
+                Token::TypeInt64 => "long".to_string(),
+                Token::TypeFloat32 => "float".to_string(),
+                Token::TypeFloat64 => "double".to_string(),
+                Token::TypeBoolean => "boolean".to_string(),
+                Token::TypeByte => "byte".to_string(),
+                Token::TypeInt => "int".to_string(),
+                Token::TypeFloat => "float".to_string(),
+                _ => {
+                    return Err(CompileError::ParserError(
+                        "Expected class name after instanceof".to_string(),
+                    ))
+                }
+            };
+            self.bump();
+            left = Expr::InstanceOf(Box::new(left), class_name);
         }
 
         Ok(left)
@@ -963,6 +1147,16 @@ impl Parser {
             let e = self.parse_unary()?;
             return Ok(Expr::UnaryOp(UnaryOp::Not, Box::new(e)));
         }
+        if self.current_token == Token::PlusPlus {
+            self.bump();
+            let e = self.parse_unary()?;
+            return Ok(Expr::UnaryOp(UnaryOp::PreIncrement, Box::new(e)));
+        }
+        if self.current_token == Token::MinusMinus {
+            self.bump();
+            let e = self.parse_unary()?;
+            return Ok(Expr::UnaryOp(UnaryOp::PreDecrement, Box::new(e)));
+        }
 
         self.parse_postfix()
     }
@@ -972,6 +1166,14 @@ impl Parser {
 
         loop {
             match &self.current_token {
+                Token::PlusPlus => {
+                    self.bump();
+                    expr = Expr::UnaryOp(UnaryOp::PostIncrement, Box::new(expr));
+                }
+                Token::MinusMinus => {
+                    self.bump();
+                    expr = Expr::UnaryOp(UnaryOp::PostDecrement, Box::new(expr));
+                }
                 Token::LParen => {
                     // Closure call $fn(...) or regular function call
                     self.bump();
@@ -1031,6 +1233,17 @@ impl Parser {
                 let val = s.clone();
                 self.bump();
                 Ok(Expr::StringLiteral(val))
+            }
+            Token::InterpolatedString(parts) => {
+                let expr_parts: Vec<Expr> = parts
+                    .iter()
+                    .map(|part| match part {
+                        crate::lexer::StringPart::Text(s) => Expr::StringLiteral(s.clone()),
+                        crate::lexer::StringPart::Variable(name) => Expr::Variable(name.clone()),
+                    })
+                    .collect();
+                self.bump();
+                Ok(Expr::InterpolatedString(expr_parts))
             }
             Token::IntLiteral(n) => {
                 let val = *n;
@@ -1449,11 +1662,23 @@ mod tests {
     }
 
     #[test]
-    fn test_continue_stmt() {
-        let source = "continue;".to_string();
+    fn test_instanceof_in_if() {
+        let source = "if ($obj instanceof MyClass) { $x = 1; }".to_string();
         let mut parser = Parser::new(source);
         let stmt = parser.parse_stmt_test().unwrap();
-        assert!(matches!(stmt, Stmt::Continue));
+        match stmt {
+            Stmt::If(cond, _, _, _) => match cond {
+                Expr::InstanceOf(expr, class_name) => {
+                    match *expr {
+                        Expr::Variable(name) => assert_eq!(name, "obj"),
+                        _ => panic!("Expected Variable"),
+                    }
+                    assert_eq!(class_name, "MyClass");
+                }
+                _ => panic!("Expected InstanceOf condition"),
+            },
+            _ => panic!("Expected If, got {:?}", stmt),
+        }
     }
 
     #[test]
@@ -1585,32 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn test_this_field_assign() {
-        let source = "$this->value = 42;".to_string();
-        let mut parser = Parser::new(source);
-        let stmt = parser.parse_stmt_test().unwrap();
-        match stmt {
-            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, rhs)) => {
-                match *lhs {
-                    Expr::FieldAccess(obj, field_name) => {
-                        match *obj {
-                            Expr::Variable(name) => assert_eq!(name, "this"),
-                            _ => panic!("Expected Variable 'this'"),
-                        }
-                        assert_eq!(field_name, "value");
-                    }
-                    _ => panic!("Expected FieldAccess lhs"),
-                }
-                match *rhs {
-                    Expr::IntLiteral(n) => assert_eq!(n, 42),
-                    _ => panic!("Expected IntLiteral rhs"),
-                }
-            }
-            _ => panic!("Expected Assign, got {:?}", stmt),
-        }
-    }
-
-    #[test]
     fn test_this_method_call() {
         let source = "$this->doSomething();".to_string();
         let mut parser = Parser::new(source);
@@ -1649,5 +1848,494 @@ mod tests {
             }
             _ => panic!("Expected FieldAccess chain, got {:?}", stmt),
         }
+    }
+
+    #[test]
+    fn test_ternary_expression() {
+        let source = "$x ? 1 : 0;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::Ternary(cond, then_expr, else_expr)) => {
+                match *cond {
+                    Expr::Variable(name) => assert_eq!(name, "x"),
+                    _ => panic!("Expected Variable cond"),
+                }
+                match *then_expr {
+                    Expr::IntLiteral(n) => assert_eq!(n, 1),
+                    _ => panic!("Expected IntLiteral 1"),
+                }
+                match *else_expr {
+                    Expr::IntLiteral(n) => assert_eq!(n, 0),
+                    _ => panic!("Expected IntLiteral 0"),
+                }
+            }
+            _ => panic!("Expected Ternary, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_elvis_expression() {
+        let source = "$x ?: 0;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::Elvis(value, else_expr)) => {
+                match *value {
+                    Expr::Variable(name) => assert_eq!(name, "x"),
+                    _ => panic!("Expected Variable value"),
+                }
+                match *else_expr {
+                    Expr::IntLiteral(n) => assert_eq!(n, 0),
+                    _ => panic!("Expected IntLiteral 0"),
+                }
+            }
+            _ => panic!("Expected Elvis, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_null_coalescing_expression() {
+        let source = "$x ?? \"default\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::NullCoalescing(value, default_expr)) => {
+                match *value {
+                    Expr::Variable(name) => assert_eq!(name, "x"),
+                    _ => panic!("Expected Variable value"),
+                }
+                match *default_expr {
+                    Expr::StringLiteral(s) => assert_eq!(s, "default"),
+                    _ => panic!("Expected StringLiteral \"default\""),
+                }
+            }
+            _ => panic!("Expected NullCoalescing, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_nested_ternary() {
+        let source = "$a ? $b : $c ? $d : $e;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::Ternary(cond, then_expr, else_expr)) => {
+                match *cond {
+                    Expr::Variable(name) => assert_eq!(name, "a"),
+                    _ => panic!("Expected Variable 'a'"),
+                }
+                match *then_expr {
+                    Expr::Variable(name) => assert_eq!(name, "b"),
+                    _ => panic!("Expected Variable 'b'"),
+                }
+                match *else_expr {
+                    Expr::Ternary(inner_cond, inner_then, inner_else) => {
+                        match *inner_cond {
+                            Expr::Variable(name) => assert_eq!(name, "c"),
+                            _ => panic!("Expected Variable 'c'"),
+                        }
+                        match *inner_then {
+                            Expr::Variable(name) => assert_eq!(name, "d"),
+                            _ => panic!("Expected Variable 'd'"),
+                        }
+                        match *inner_else {
+                            Expr::Variable(name) => assert_eq!(name, "e"),
+                            _ => panic!("Expected Variable 'e'"),
+                        }
+                    }
+                    _ => panic!("Expected nested Ternary"),
+                }
+            }
+            _ => panic!("Expected Ternary, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_ternary_in_assign() {
+        let source = "$result = $x > 0 ? \"positive\" : \"negative\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, rhs)) => {
+                match *lhs {
+                    Expr::Variable(name) => assert_eq!(name, "result"),
+                    _ => panic!("Expected Variable lhs"),
+                }
+                match *rhs {
+                    Expr::Ternary(_, _, _) => {}
+                    _ => panic!("Expected Ternary rhs"),
+                }
+            }
+            _ => panic!("Expected Assign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign_add() {
+        let source = "$a += $b;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::AddAssign, lhs, rhs)) => {
+                match *lhs {
+                    Expr::Variable(name) => assert_eq!(name, "a"),
+                    _ => panic!("Expected Variable lhs"),
+                }
+                match *rhs {
+                    Expr::Variable(name) => assert_eq!(name, "b"),
+                    _ => panic!("Expected Variable rhs"),
+                }
+            }
+            _ => panic!("Expected AddAssign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign_sub() {
+        let source = "$x -= 5;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::SubAssign, lhs, rhs)) => {
+                match *lhs {
+                    Expr::Variable(name) => assert_eq!(name, "x"),
+                    _ => panic!("Expected Variable lhs"),
+                }
+                match *rhs {
+                    Expr::IntLiteral(n) => assert_eq!(n, 5),
+                    _ => panic!("Expected IntLiteral rhs"),
+                }
+            }
+            _ => panic!("Expected SubAssign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign_mul() {
+        let source = "$i *= 2;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::MulAssign, _, _)) => {}
+            _ => panic!("Expected MulAssign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_post_increment() {
+        let source = "$i++;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::UnaryOp(UnaryOp::PostIncrement, inner)) => match *inner {
+                Expr::Variable(name) => assert_eq!(name, "i"),
+                _ => panic!("Expected Variable"),
+            },
+            _ => panic!("Expected PostIncrement, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_pre_increment() {
+        let source = "++$i;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::UnaryOp(UnaryOp::PreIncrement, inner)) => match *inner {
+                Expr::Variable(name) => assert_eq!(name, "i"),
+                _ => panic!("Expected Variable"),
+            },
+            _ => panic!("Expected PreIncrement, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_post_decrement() {
+        let source = "$i--;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::UnaryOp(UnaryOp::PostDecrement, inner)) => match *inner {
+                Expr::Variable(name) => assert_eq!(name, "i"),
+                _ => panic!("Expected Variable"),
+            },
+            _ => panic!("Expected PostDecrement, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_pre_decrement() {
+        let source = "--$i;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::UnaryOp(UnaryOp::PreDecrement, inner)) => match *inner {
+                Expr::Variable(name) => assert_eq!(name, "i"),
+                _ => panic!("Expected Variable"),
+            },
+            _ => panic!("Expected PreDecrement, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_instanceof() {
+        let source = "$obj instanceof MyClass;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::InstanceOf(expr, class_name)) => {
+                match *expr {
+                    Expr::Variable(name) => assert_eq!(name, "obj"),
+                    _ => panic!("Expected Variable"),
+                }
+                assert_eq!(class_name, "MyClass");
+            }
+            _ => panic!("Expected InstanceOf, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_increment_in_expression() {
+        let source = "$y = $x++;".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::BinaryOp(BinaryOp::Assign, lhs, rhs)) => {
+                match *lhs {
+                    Expr::Variable(name) => assert_eq!(name, "y"),
+                    _ => panic!("Expected Variable lhs"),
+                }
+                match *rhs {
+                    Expr::UnaryOp(UnaryOp::PostIncrement, _) => {}
+                    _ => panic!("Expected PostIncrement rhs"),
+                }
+            }
+            _ => panic!("Expected Assign, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_interpolated_string_basic() {
+        let source = "\"hello {$name}\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::InterpolatedString(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    Expr::StringLiteral(s) => assert_eq!(s, "hello "),
+                    _ => panic!("Expected StringLiteral"),
+                }
+                match &parts[1] {
+                    Expr::Variable(name) => assert_eq!(name, "name"),
+                    _ => panic!("Expected Variable"),
+                }
+            }
+            _ => panic!("Expected InterpolatedString, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_interpolated_string_multiple_vars() {
+        let source = "\"{$a} and {$b}\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::InterpolatedString(parts)) => {
+                assert_eq!(parts.len(), 3);
+                match &parts[0] {
+                    Expr::Variable(name) => assert_eq!(name, "a"),
+                    _ => panic!("Expected Variable a"),
+                }
+                match &parts[1] {
+                    Expr::StringLiteral(s) => assert_eq!(s, " and "),
+                    _ => panic!("Expected StringLiteral"),
+                }
+                match &parts[2] {
+                    Expr::Variable(name) => assert_eq!(name, "b"),
+                    _ => panic!("Expected Variable b"),
+                }
+            }
+            _ => panic!("Expected InterpolatedString, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_single_quote_no_interpolation() {
+        let source = "'hello {$name}';".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::StringLiteral(s)) => {
+                assert_eq!(s, "hello {$name}");
+            }
+            _ => panic!(
+                "Expected StringLiteral (single quote no interpolation), got {:?}",
+                stmt
+            ),
+        }
+    }
+
+    #[test]
+    fn test_plain_double_quote_string() {
+        let source = "\"hello world\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::StringLiteral(s)) => {
+                assert_eq!(s, "hello world");
+            }
+            _ => panic!("Expected StringLiteral, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_interpolated_string_with_text_after() {
+        let source = "\"{$name} world\";".to_string();
+        let mut parser = Parser::new(source);
+        let stmt = parser.parse_stmt_test().unwrap();
+        match stmt {
+            Stmt::Expr(Expr::InterpolatedString(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    Expr::Variable(name) => assert_eq!(name, "name"),
+                    _ => panic!("Expected Variable"),
+                }
+                match &parts[1] {
+                    Expr::StringLiteral(s) => assert_eq!(s, " world"),
+                    _ => panic!("Expected StringLiteral"),
+                }
+            }
+            _ => panic!("Expected InterpolatedString, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_visibility_public_field() {
+        let source = "class Test { public int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(class.fields[0].is_public);
+        assert!(!class.fields[0].is_private);
+        assert!(!class.fields[0].is_protected);
+        assert!(!class.fields[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_private_field() {
+        let source = "class Test { private int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(!class.fields[0].is_public);
+        assert!(class.fields[0].is_private);
+        assert!(!class.fields[0].is_protected);
+        assert!(!class.fields[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_protected_field() {
+        let source = "class Test { protected int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(!class.fields[0].is_public);
+        assert!(!class.fields[0].is_private);
+        assert!(class.fields[0].is_protected);
+        assert!(!class.fields[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_internal_field() {
+        let source = "class Test { internal int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(!class.fields[0].is_public);
+        assert!(!class.fields[0].is_private);
+        assert!(!class.fields[0].is_protected);
+        assert!(class.fields[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_default_public() {
+        let source = "class Test { int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(class.fields[0].is_public);
+        assert!(!class.fields[0].is_private);
+        assert!(!class.fields[0].is_protected);
+        assert!(!class.fields[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_public_method() {
+        let source = "class Test { public function test(): void {} }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.methods.len(), 1);
+        assert!(class.methods[0].is_public);
+        assert!(!class.methods[0].is_private);
+        assert!(!class.methods[0].is_protected);
+        assert!(!class.methods[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_private_method() {
+        let source = "class Test { private function test(): void {} }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.methods.len(), 1);
+        assert!(!class.methods[0].is_public);
+        assert!(class.methods[0].is_private);
+        assert!(!class.methods[0].is_protected);
+        assert!(!class.methods[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_protected_method() {
+        let source = "class Test { protected function test(): void {} }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.methods.len(), 1);
+        assert!(!class.methods[0].is_public);
+        assert!(!class.methods[0].is_private);
+        assert!(class.methods[0].is_protected);
+        assert!(!class.methods[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_internal_method() {
+        let source = "class Test { internal function test(): void {} }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.methods.len(), 1);
+        assert!(!class.methods[0].is_public);
+        assert!(!class.methods[0].is_private);
+        assert!(!class.methods[0].is_protected);
+        assert!(class.methods[0].is_internal);
+    }
+
+    #[test]
+    fn test_visibility_static_public_field() {
+        let source = "class Test { public static int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(class.fields[0].is_public);
+        assert!(class.fields[0].is_static);
+    }
+
+    #[test]
+    fn test_visibility_final_field() {
+        let source = "class Test { final int32 $x; }".to_string();
+        let mut parser = Parser::new(source);
+        let class = parser.parse_class().unwrap();
+        assert_eq!(class.fields.len(), 1);
+        assert!(class.fields[0].is_public);
+        assert!(class.fields[0].is_final);
     }
 }

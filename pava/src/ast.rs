@@ -14,12 +14,22 @@ impl Expr {
                 BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => Ok(Type::Boolean),
                 BinaryOp::Eq | BinaryOp::Ne => Ok(Type::Boolean),
                 BinaryOp::And | BinaryOp::Or => Ok(Type::Boolean),
-                BinaryOp::Assign => Ok(Type::Int32),
+                BinaryOp::Assign
+                | BinaryOp::AddAssign
+                | BinaryOp::SubAssign
+                | BinaryOp::MulAssign
+                | BinaryOp::DivAssign
+                | BinaryOp::ModAssign => Ok(Type::Int32),
             },
             Expr::UnaryOp(op, _) => match op {
                 UnaryOp::Neg => Ok(Type::Int32),
                 UnaryOp::Not => Ok(Type::Boolean),
+                UnaryOp::PreIncrement
+                | UnaryOp::PostIncrement
+                | UnaryOp::PreDecrement
+                | UnaryOp::PostDecrement => Ok(Type::Int32),
             },
+            Expr::InstanceOf(_, _) => Ok(Type::Boolean),
             _ => Ok(Type::String),
         }
     }
@@ -90,6 +100,7 @@ pub struct ClassField {
     pub is_public: bool,
     pub is_private: bool,
     pub is_protected: bool,
+    pub is_internal: bool, // 模块内可见
     pub is_final: bool,
     pub initializer: Option<Expr>,
 }
@@ -103,6 +114,9 @@ pub struct ClassMethod {
     pub body: Vec<Stmt>,
     pub is_static: bool,
     pub is_public: bool,
+    pub is_private: bool,
+    pub is_protected: bool,
+    pub is_internal: bool, // 模块内可见
     pub is_abstract: bool,
     pub is_default: bool,
 }
@@ -114,6 +128,7 @@ pub struct PromotedParam {
     pub is_public: bool,
     pub is_private: bool,
     pub is_protected: bool,
+    pub is_internal: bool, // 模块内可见
 }
 
 #[derive(Debug, Clone)]
@@ -151,12 +166,17 @@ pub enum Expr {
     IntLiteral(i64),
     FloatLiteral(f64),
     StringLiteral(String),
+    InterpolatedString(Vec<Expr>), // "hi {$name}" -> [StringLiteral("hi "), Variable("name")]
     BoolLiteral(bool),
     NullLiteral,
     Variable(String),
     BinaryOp(BinaryOp, Box<Expr>, Box<Expr>),
     UnaryOp(UnaryOp, Box<Expr>),
     Cast(Box<Expr>, Type),
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>), // $a ? $b : $c
+    Elvis(Box<Expr>, Box<Expr>),              // $a ?: $c (when $a is truthy, return $a; else $c)
+    NullCoalescing(Box<Expr>, Box<Expr>),     // $a ?? $c (when $a is null, return $c; else $a)
+    InstanceOf(Box<Expr>, String),            // $obj instanceof ClassName
     NewObject(String, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     StaticCall(String, String, Vec<Expr>),
@@ -198,12 +218,21 @@ pub enum BinaryOp {
     And,
     Or,
     Assign,
+    AddAssign, // +=
+    SubAssign, // -=
+    MulAssign, // *=
+    DivAssign, // /=
+    ModAssign, // %=
 }
 
 #[derive(Debug, Clone)]
 pub enum UnaryOp {
     Neg,
     Not,
+    PreIncrement,  // ++$i
+    PostIncrement, // $i++
+    PreDecrement,  // --$i
+    PostDecrement, // $i--
 }
 
 #[derive(Debug, Clone)]

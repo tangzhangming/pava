@@ -226,6 +226,20 @@ impl CodeGen {
             }
             Expr::UnaryOp(_, inner) => self.collect_constants_from_expr(inner),
             Expr::Cast(inner, _) => self.collect_constants_from_expr(inner),
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                self.collect_constants_from_expr(cond);
+                self.collect_constants_from_expr(then_expr);
+                self.collect_constants_from_expr(else_expr);
+            }
+            Expr::Elvis(value, else_expr) => {
+                self.collect_constants_from_expr(value);
+                self.collect_constants_from_expr(else_expr);
+            }
+            Expr::NullCoalescing(value, default_expr) => {
+                self.collect_constants_from_expr(value);
+                self.collect_constants_from_expr(default_expr);
+            }
+            Expr::InstanceOf(expr, _) => self.collect_constants_from_expr(expr),
             _ => {}
         }
     }
@@ -455,8 +469,11 @@ impl CodeGen {
     }
 
     fn emit_field(&mut self, bytes: &mut Vec<u8>, field: &ClassField) {
-        let access_flags = if field.is_public { ACC_PUBLIC } else { 0 }
-            | if field.is_private { ACC_PRIVATE } else { 0 }
+        let access_flags = if field.is_public || field.is_internal {
+            ACC_PUBLIC
+        } else {
+            0
+        } | if field.is_private { ACC_PRIVATE } else { 0 }
             | if field.is_protected { ACC_PROTECTED } else { 0 }
             | if field.is_static { ACC_STATIC } else { 0 }
             | if field.is_final { ACC_FINAL } else { 0 };
@@ -487,8 +504,11 @@ impl CodeGen {
     }
 
     fn emit_promoted_field(&mut self, bytes: &mut Vec<u8>, promoted: &PromotedParam) {
-        let access_flags = if promoted.is_public { ACC_PUBLIC } else { 0 }
-            | if promoted.is_private { ACC_PRIVATE } else { 0 }
+        let access_flags = if promoted.is_public || promoted.is_internal {
+            ACC_PUBLIC
+        } else {
+            0
+        } | if promoted.is_private { ACC_PRIVATE } else { 0 }
             | if promoted.is_protected {
                 ACC_PROTECTED
             } else {
@@ -620,7 +640,16 @@ impl CodeGen {
     }
 
     fn emit_method(&mut self, bytes: &mut Vec<u8>, method: &ClassMethod) -> CompileResult<()> {
-        let access_flags = if method.is_public { ACC_PUBLIC } else { 0 }
+        let access_flags = if method.is_public || method.is_internal {
+            ACC_PUBLIC
+        } else {
+            0
+        } | if method.is_private { ACC_PRIVATE } else { 0 }
+            | if method.is_protected {
+                ACC_PROTECTED
+            } else {
+                0
+            }
             | if method.is_static { ACC_STATIC } else { 0 }
             | if method.is_abstract { ACC_ABSTRACT } else { 0 };
 
@@ -1053,6 +1082,7 @@ impl CodeGen {
                 }
             }
             Expr::StringLiteral(s) => self.emit_string(s)?,
+            Expr::InterpolatedString(parts) => self.emit_interpolated_string(parts)?,
             Expr::BoolLiteral(b) => self.code_buffer.push(if *b { 0x04 } else { 0x03 }),
             Expr::NullLiteral => self.code_buffer.push(0x01),
             Expr::Variable(name) => self.emit_load_var(name)?,
@@ -1072,7 +1102,14 @@ impl CodeGen {
             Expr::ClosureCall(func, args) => self.emit_closure_call(func, args)?,
             Expr::NewObject(class_name, args) => self.emit_new_object(class_name, args)?,
             Expr::Cast(expr, target_type) => self.emit_cast(expr, target_type)?,
-            // Unhandled expression types - can be extended
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                self.emit_ternary(cond, then_expr, else_expr)?
+            }
+            Expr::Elvis(value, else_expr) => self.emit_elvis(value, else_expr)?,
+            Expr::NullCoalescing(value, default_expr) => {
+                self.emit_null_coalescing(value, default_expr)?
+            }
+            Expr::InstanceOf(expr, class_name) => self.emit_instanceof(expr, class_name)?,
         }
         Ok(())
     }
@@ -1142,6 +1179,31 @@ impl CodeGen {
     fn emit_string(&mut self, s: &str) -> CompileResult<()> {
         let idx = self.add_utf8_constant(s);
         self.emit_ldc(idx);
+        Ok(())
+    }
+
+    fn emit_interpolated_string(&mut self, parts: &[Expr]) -> CompileResult<()> {
+        let sb_class = self.add_class_constant("java/lang/StringBuilder");
+        self.code_buffer.push(0xBB);
+        self.code_buffer.extend_from_slice(&sb_class.to_be_bytes());
+        self.code_buffer.push(0x59);
+
+        let sb_init = self.add_methodref_constant("java/lang/StringBuilder", "<init>", "()V");
+        self.code_buffer.push(0xB7);
+        self.code_buffer.extend_from_slice(&sb_init.to_be_bytes());
+
+        for part in parts {
+            self.emit_append_to_stringbuilder(part)?;
+        }
+
+        let to_string = self.add_methodref_constant(
+            "java/lang/StringBuilder",
+            "toString",
+            "()Ljava/lang/String;",
+        );
+        self.code_buffer.push(0xB6);
+        self.code_buffer.extend_from_slice(&to_string.to_be_bytes());
+
         Ok(())
     }
 
@@ -1294,6 +1356,63 @@ impl CodeGen {
                 self.emit_expr(right)?;
                 self.emit_store_field(left)?;
             }
+            BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign => {
+                self.emit_compound_assign(op, left, right)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_compound_assign(
+        &mut self,
+        op: &BinaryOp,
+        left: &Expr,
+        right: &Expr,
+    ) -> CompileResult<()> {
+        match left {
+            Expr::Variable(name) => {
+                self.emit_load_var(name)?;
+                self.emit_expr(right)?;
+                match op {
+                    BinaryOp::AddAssign => self.code_buffer.push(0x60),
+                    BinaryOp::SubAssign => self.code_buffer.push(0x64),
+                    BinaryOp::MulAssign => self.code_buffer.push(0x68),
+                    BinaryOp::DivAssign => self.code_buffer.push(0x6C),
+                    BinaryOp::ModAssign => self.code_buffer.push(0x70),
+                    _ => unreachable!(),
+                }
+                let ty = self.infer_expr_type(left);
+                self.emit_store_var(name, ty)?;
+            }
+            Expr::FieldAccess(obj, field_name) => {
+                self.emit_expr(obj)?;
+                self.emit_expr(obj)?;
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.emit_expr(right)?;
+                match op {
+                    BinaryOp::AddAssign => self.code_buffer.push(0x60),
+                    BinaryOp::SubAssign => self.code_buffer.push(0x64),
+                    BinaryOp::MulAssign => self.code_buffer.push(0x68),
+                    BinaryOp::DivAssign => self.code_buffer.push(0x6C),
+                    BinaryOp::ModAssign => self.code_buffer.push(0x70),
+                    _ => unreachable!(),
+                }
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1688,14 +1807,249 @@ impl CodeGen {
     }
 
     fn emit_unary_op(&mut self, op: &UnaryOp, expr: &Expr) -> CompileResult<()> {
-        self.emit_expr(expr)?;
         match op {
-            UnaryOp::Neg => self.code_buffer.push(0x74),
+            UnaryOp::Neg => {
+                self.emit_expr(expr)?;
+                self.code_buffer.push(0x74);
+            }
             UnaryOp::Not => {
+                self.emit_expr(expr)?;
                 self.code_buffer.push(0x04);
                 self.code_buffer.push(0x82);
             }
+            UnaryOp::PreIncrement => self.emit_pre_increment(expr)?,
+            UnaryOp::PostIncrement => self.emit_post_increment(expr)?,
+            UnaryOp::PreDecrement => self.emit_pre_decrement(expr)?,
+            UnaryOp::PostDecrement => self.emit_post_decrement(expr)?,
         }
+        Ok(())
+    }
+
+    fn emit_pre_increment(&mut self, expr: &Expr) -> CompileResult<()> {
+        match expr {
+            Expr::Variable(name) => {
+                self.emit_load_var(name)?;
+                self.code_buffer.push(0x04);
+                self.code_buffer.push(0x60);
+                let ty = self.infer_expr_type(expr);
+                self.emit_store_var(name, ty)?;
+                self.emit_load_var(name)?;
+            }
+            Expr::FieldAccess(obj, field_name) => {
+                self.emit_expr(obj)?;
+                self.emit_expr(obj)?;
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x04);
+                self.code_buffer.push(0x60);
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.emit_expr(obj)?;
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_post_increment(&mut self, expr: &Expr) -> CompileResult<()> {
+        match expr {
+            Expr::Variable(name) => {
+                self.emit_load_var(name)?;
+                self.code_buffer.push(0x59);
+                self.code_buffer.push(0x04);
+                self.code_buffer.push(0x60);
+                let ty = self.infer_expr_type(expr);
+                self.emit_store_var(name, ty)?;
+            }
+            Expr::FieldAccess(obj, field_name) => {
+                self.emit_expr(obj)?;
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x59);
+                self.emit_expr(obj)?;
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x04);
+                self.code_buffer.push(0x60);
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_pre_decrement(&mut self, expr: &Expr) -> CompileResult<()> {
+        match expr {
+            Expr::Variable(name) => {
+                self.emit_load_var(name)?;
+                self.code_buffer.push(0x03);
+                self.code_buffer.push(0x64);
+                let ty = self.infer_expr_type(expr);
+                self.emit_store_var(name, ty)?;
+                self.emit_load_var(name)?;
+            }
+            Expr::FieldAccess(obj, field_name) => {
+                self.emit_expr(obj)?;
+                self.emit_expr(obj)?;
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x03);
+                self.code_buffer.push(0x64);
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.emit_expr(obj)?;
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_post_decrement(&mut self, expr: &Expr) -> CompileResult<()> {
+        match expr {
+            Expr::Variable(name) => {
+                self.emit_load_var(name)?;
+                self.code_buffer.push(0x59);
+                self.code_buffer.push(0x03);
+                self.code_buffer.push(0x64);
+                let ty = self.infer_expr_type(expr);
+                self.emit_store_var(name, ty)?;
+            }
+            Expr::FieldAccess(obj, field_name) => {
+                self.emit_expr(obj)?;
+                let class_name = self.infer_class_name_from_expr(obj);
+                let field_type = self
+                    .class_fields
+                    .get(field_name)
+                    .map(|t| t.to_jvm_descriptor())
+                    .unwrap_or_else(|| "I".to_string());
+                let field_idx = self.add_fieldref_constant(&class_name, field_name, &field_type);
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x59);
+                self.emit_expr(obj)?;
+                self.code_buffer.push(0xB4);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                self.code_buffer.push(0x03);
+                self.code_buffer.push(0x64);
+                self.code_buffer.push(0xB5);
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_instanceof(&mut self, expr: &Expr, class_name: &str) -> CompileResult<()> {
+        self.emit_expr(expr)?;
+        let class_idx = self.add_class_constant(class_name);
+        self.code_buffer.push(0xC1);
+        self.code_buffer.extend_from_slice(&class_idx.to_be_bytes());
+        Ok(())
+    }
+
+    fn emit_ternary(
+        &mut self,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> CompileResult<()> {
+        self.emit_expr(cond)?;
+        self.code_buffer.push(0x9A);
+        let jmp_to_else_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        self.emit_expr(then_expr)?;
+        self.code_buffer.push(0xA7);
+        let goto_end_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        let else_start = self.code_buffer.len();
+        self.emit_expr(else_expr)?;
+
+        let end_pos = self.code_buffer.len();
+        let jmp_to_else_offset = (else_start - jmp_to_else_pos + 1) as i16;
+        self.code_buffer[jmp_to_else_pos..jmp_to_else_pos + 2]
+            .copy_from_slice(&jmp_to_else_offset.to_be_bytes());
+        let goto_end_offset = (end_pos - goto_end_pos + 1) as i16;
+        self.code_buffer[goto_end_pos..goto_end_pos + 2]
+            .copy_from_slice(&goto_end_offset.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_elvis(&mut self, value: &Expr, else_expr: &Expr) -> CompileResult<()> {
+        self.emit_expr(value)?;
+        self.code_buffer.push(0x59);
+        self.code_buffer.push(0x9A);
+        let jmp_to_else_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        self.code_buffer.push(0xA7);
+        let goto_end_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        let else_start = self.code_buffer.len();
+        self.emit_expr(else_expr)?;
+
+        let end_pos = self.code_buffer.len();
+        let jmp_to_else_offset = (else_start - jmp_to_else_pos + 1) as i16;
+        self.code_buffer[jmp_to_else_pos..jmp_to_else_pos + 2]
+            .copy_from_slice(&jmp_to_else_offset.to_be_bytes());
+        let goto_end_offset = (end_pos - goto_end_pos + 1) as i16;
+        self.code_buffer[goto_end_pos..goto_end_pos + 2]
+            .copy_from_slice(&goto_end_offset.to_be_bytes());
+
+        Ok(())
+    }
+
+    fn emit_null_coalescing(&mut self, value: &Expr, default_expr: &Expr) -> CompileResult<()> {
+        self.emit_expr(value)?;
+        self.code_buffer.push(0x59);
+        self.code_buffer.push(0xC6);
+        let jmp_to_default_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        self.code_buffer.push(0xA7);
+        let goto_end_pos = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        let default_start = self.code_buffer.len();
+        self.emit_expr(default_expr)?;
+
+        let end_pos = self.code_buffer.len();
+        let jmp_to_default_offset = (default_start - jmp_to_default_pos + 1) as i16;
+        self.code_buffer[jmp_to_default_pos..jmp_to_default_pos + 2]
+            .copy_from_slice(&jmp_to_default_offset.to_be_bytes());
+        let goto_end_offset = (end_pos - goto_end_pos + 1) as i16;
+        self.code_buffer[goto_end_pos..goto_end_pos + 2]
+            .copy_from_slice(&goto_end_offset.to_be_bytes());
+
         Ok(())
     }
 
@@ -2016,6 +2370,7 @@ impl CodeGen {
                 }
             }
             Expr::StringLiteral(_) => VarType::String,
+            Expr::InterpolatedString(_) => VarType::String,
             Expr::BoolLiteral(_) => VarType::Bool,
             Expr::BinaryOp(op, left, right) => {
                 let left_ty = self.infer_expr_type(left);
@@ -2054,6 +2409,11 @@ impl CodeGen {
                     | BinaryOp::And
                     | BinaryOp::Or => VarType::Bool,
                     BinaryOp::Assign => left_ty,
+                    BinaryOp::AddAssign
+                    | BinaryOp::SubAssign
+                    | BinaryOp::MulAssign
+                    | BinaryOp::DivAssign
+                    | BinaryOp::ModAssign => left_ty,
                 }
             }
             Expr::Variable(name) => self
@@ -2063,6 +2423,25 @@ impl CodeGen {
                 .unwrap_or(VarType::Int),
             Expr::NewObject(_, _) => VarType::Ref,
             Expr::FieldAccess(_, _) | Expr::StaticFieldAccess(_, _) => VarType::Ref,
+            Expr::Ternary(_, then_expr, else_expr) => {
+                let then_ty = self.infer_expr_type(then_expr);
+                let else_ty = self.infer_expr_type(else_expr);
+                if then_ty == else_ty {
+                    then_ty
+                } else {
+                    VarType::Ref
+                }
+            }
+            Expr::Elvis(value, _) => self.infer_expr_type(value),
+            Expr::NullCoalescing(value, _) => self.infer_expr_type(value),
+            Expr::InstanceOf(_, _) => VarType::Bool,
+            Expr::UnaryOp(op, inner) => match op {
+                UnaryOp::Neg | UnaryOp::Not => self.infer_expr_type(inner),
+                UnaryOp::PreIncrement
+                | UnaryOp::PostIncrement
+                | UnaryOp::PreDecrement
+                | UnaryOp::PostDecrement => self.infer_expr_type(inner),
+            },
             _ => VarType::Ref,
         }
     }

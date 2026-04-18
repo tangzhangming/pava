@@ -1,6 +1,12 @@
 use crate::error::{CompileError, CompileResult};
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StringPart {
+    Text(String),
+    Variable(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
     Class,
@@ -34,6 +40,7 @@ pub enum Token {
     Implements,
     Case,
     Open,
+    Internal, // 模块内可见性修饰符
 
     // Types
     Type(String),
@@ -54,6 +61,7 @@ pub enum Token {
 
     // Literals
     StringLiteral(String),
+    InterpolatedString(Vec<StringPart>), // "hi {$name}" 双引号插值字符串
     IntLiteral(i64),
     FloatLiteral(f64),
 
@@ -69,6 +77,16 @@ pub enum Token {
     Colon,
     Semicolon,
     Question,
+    QuestionColon,  // ?: (PHP elvis operator)
+    DoubleQuestion, // ?? (PHP null coalescing operator)
+    PlusPlus,       // ++ (increment)
+    MinusMinus,     // -- (decrement)
+    PlusEqual,      // += (compound assign)
+    MinusEqual,     // -=
+    StarEqual,      // *=
+    SlashEqual,     // /=
+    PercentEqual,   // %=
+    Instanceof,     // instanceof keyword
     Lt,
     Gt,
     Le,
@@ -226,20 +244,60 @@ impl Lexer {
         }
 
         let token = match self.ch {
-            '+' => Token::Plus,
+            '+' => {
+                let next_ch = self.peek_char();
+                if next_ch == '+' {
+                    self.read_char();
+                    Token::PlusPlus
+                } else if next_ch == '=' {
+                    self.read_char();
+                    Token::PlusEqual
+                } else {
+                    Token::Plus
+                }
+            }
             '-' => {
-                // Check for -> (arrow)
                 let next_ch = self.peek_char();
                 if next_ch == '>' {
                     self.read_char();
                     Token::Arrow
+                } else if next_ch == '-' {
+                    self.read_char();
+                    Token::MinusMinus
+                } else if next_ch == '=' {
+                    self.read_char();
+                    Token::MinusEqual
                 } else {
                     Token::Minus
                 }
             }
-            '*' => Token::Star,
-            '/' => Token::Slash,
-            '%' => Token::Percent,
+            '*' => {
+                let next_ch = self.peek_char();
+                if next_ch == '=' {
+                    self.read_char();
+                    Token::StarEqual
+                } else {
+                    Token::Star
+                }
+            }
+            '/' => {
+                let next_ch = self.peek_char();
+                if next_ch == '=' {
+                    self.read_char();
+                    Token::SlashEqual
+                } else {
+                    Token::Slash
+                }
+            }
+            '%' => {
+                let next_ch = self.peek_char();
+                if next_ch == '=' {
+                    self.read_char();
+                    Token::PercentEqual
+                } else {
+                    Token::Percent
+                }
+            }
             '=' => {
                 // Check for == (Eq)
                 let next_ch = self.peek_char();
@@ -289,7 +347,18 @@ impl Lexer {
                     Token::Not
                 }
             }
-            '?' => Token::Question,
+            '?' => {
+                let next_ch = self.peek_char();
+                if next_ch == ':' {
+                    self.read_char();
+                    Token::QuestionColon
+                } else if next_ch == '?' {
+                    self.read_char();
+                    Token::DoubleQuestion
+                } else {
+                    Token::Question
+                }
+            }
             '&' => {
                 // Check for && (And)
                 let next_ch = self.peek_char();
@@ -383,6 +452,8 @@ impl Lexer {
             "implements" => Token::Implements,
             "case" => Token::Case,
             "open" => Token::Open,
+            "internal" => Token::Internal,
+            "instanceof" => Token::Instanceof,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,
             "int8" => Token::TypeInt8,
@@ -438,30 +509,104 @@ impl Lexer {
         let quote = self.ch;
         self.read_char();
 
-        let mut value = String::new();
-        while self.ch != quote && self.ch != '\0' {
-            if self.ch == '\\' {
-                self.read_char();
-                match self.ch {
-                    'n' => value.push('\n'),
-                    't' => value.push('\t'),
-                    'r' => value.push('\r'),
-                    '\\' => value.push('\\'),
-                    '\'' => value.push('\''),
-                    '"' => value.push('"'),
-                    _ => value.push(self.ch),
+        if quote == '\'' {
+            let mut value = String::new();
+            while self.ch != quote && self.ch != '\0' {
+                if self.ch == '\\' {
+                    self.read_char();
+                    match self.ch {
+                        'n' => value.push('\n'),
+                        't' => value.push('\t'),
+                        'r' => value.push('\r'),
+                        '\\' => value.push('\\'),
+                        '\'' => value.push('\''),
+                        '"' => value.push('"'),
+                        _ => value.push(self.ch),
+                    }
+                } else {
+                    value.push(self.ch);
                 }
-            } else {
-                value.push(self.ch);
+                self.read_char();
             }
+
+            if self.ch != quote {
+                return Err(CompileError::LexerError("Unterminated string".to_string()));
+            }
+
             self.read_char();
-        }
+            Ok(Token::StringLiteral(value))
+        } else {
+            let mut parts: Vec<StringPart> = Vec::new();
+            let mut current_text = String::new();
 
-        if self.ch != quote {
-            return Err(CompileError::LexerError("Unterminated string".to_string()));
-        }
+            while self.ch != quote && self.ch != '\0' {
+                if self.ch == '\\' {
+                    self.read_char();
+                    match self.ch {
+                        'n' => current_text.push('\n'),
+                        't' => current_text.push('\t'),
+                        'r' => current_text.push('\r'),
+                        '\\' => current_text.push('\\'),
+                        '\'' => current_text.push('\''),
+                        '"' => current_text.push('"'),
+                        '$' => current_text.push('$'),
+                        '{' => current_text.push('{'),
+                        _ => current_text.push(self.ch),
+                    }
+                    self.read_char();
+                } else if self.ch == '{' {
+                    let next_ch = self.peek_char();
+                    if next_ch == '$' {
+                        if !current_text.is_empty() {
+                            parts.push(StringPart::Text(current_text.clone()));
+                            current_text.clear();
+                        }
+                        self.read_char();
+                        self.read_char();
 
-        self.read_char();
-        Ok(Token::StringLiteral(value))
+                        let mut var_name = String::new();
+                        while self.ch.is_alphanumeric() || self.ch == '_' {
+                            var_name.push(self.ch);
+                            self.read_char();
+                        }
+
+                        if self.ch != '}' {
+                            return Err(CompileError::LexerError(
+                                "Expected '}' after variable in interpolated string".to_string(),
+                            ));
+                        }
+                        self.read_char();
+                        parts.push(StringPart::Variable(var_name));
+                    } else {
+                        current_text.push(self.ch);
+                        self.read_char();
+                    }
+                } else {
+                    current_text.push(self.ch);
+                    self.read_char();
+                }
+            }
+
+            if !current_text.is_empty() {
+                parts.push(StringPart::Text(current_text));
+            }
+
+            if self.ch != quote {
+                return Err(CompileError::LexerError("Unterminated string".to_string()));
+            }
+
+            self.read_char();
+
+            if parts.is_empty() {
+                Ok(Token::StringLiteral(String::new()))
+            } else if parts.len() == 1 && matches!(parts[0], StringPart::Text(_)) {
+                Ok(Token::StringLiteral(match &parts[0] {
+                    StringPart::Text(s) => s.clone(),
+                    _ => unreachable!(),
+                }))
+            } else {
+                Ok(Token::InterpolatedString(parts))
+            }
+        }
     }
 }
