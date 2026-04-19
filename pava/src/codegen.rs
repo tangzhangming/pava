@@ -2112,7 +2112,8 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
     }
 
     fn emit_append_to_stringbuilder(&mut self, expr: &Expr) -> CompileResult<()> {
-        self.code_buffer.push(0x59);
+        // StringBuilder 已经在栈上，不需要 dup
+        // 直接加载要追加的值
         self.emit_expr(expr)?;
 
         let ty = self.infer_expr_type(expr);
