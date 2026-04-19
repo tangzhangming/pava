@@ -13,7 +13,7 @@ use pava::project::{generate_project_toml, ProjectConfig, PROJECT_TOML_NAME};
 enum Commands {
     /// 编译源文件为 class 文件（类似 javac）
     Compile {
-        /// 源文件路径（可指定多个）
+        /// 源文件路径（可指定多个，也支持 @file 从文件读取列表）
         files: Vec<String>,
         /// 输出目录（可选，覆盖 project.toml 配置）
         #[arg(short, long)]
@@ -73,14 +73,16 @@ fn main() {
 }
 
 fn cmd_compile(files: &[String], output_override: Option<&str>) -> anyhow::Result<()> {
-    if files.is_empty() {
+    let expanded_files = expand_file_args(files)?;
+
+    if expanded_files.is_empty() {
         anyhow::bail!("请指定要编译的源文件");
     }
 
-    let first_file = Path::new(&files[0]);
+    let first_file = Path::new(&expanded_files[0]);
     let (config, project_root) = match ProjectConfig::find_from_entry(first_file) {
         Ok(result) => result,
-        Err(_) => return compile_simple_mode(files, output_override),
+        Err(_) => return compile_simple_mode(&expanded_files, output_override),
     };
 
     let classes_dir = if let Some(out) = output_override {
@@ -94,12 +96,31 @@ fn cmd_compile(files: &[String], output_override: Option<&str>) -> anyhow::Resul
     println!("项目根目录: {}", project_root.display());
     println!("输出目录: {}", classes_dir.display());
 
-    for file_path in files {
+    for file_path in &expanded_files {
         compile_file_with_project(file_path, &project_root, &classes_dir)?;
     }
 
     println!("编译完成！");
     Ok(())
+}
+
+fn expand_file_args(files: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut expanded_files = Vec::new();
+    for f in files {
+        if f.starts_with('@') {
+            let list_file = &f[1..];
+            let content = fs::read_to_string(list_file)?;
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    expanded_files.push(line.to_string());
+                }
+            }
+        } else {
+            expanded_files.push(f.clone());
+        }
+    }
+    Ok(expanded_files)
 }
 
 fn compile_simple_mode(files: &[String], output_override: Option<&str>) -> anyhow::Result<()> {
@@ -183,10 +204,7 @@ fn cmd_build(project_dir: Option<&str>, force_fat: bool) -> anyhow::Result<()> {
 
     let toml_path = project_root.join(PROJECT_TOML_NAME);
     if !toml_path.exists() {
-        anyhow::bail!(
-            "未找到 {} 文件，请先运行 'pava pkg init' 初始化项目",
-            PROJECT_TOML_NAME
-        );
+        anyhow::bail!("未找到 {} 文件，请先运行 'pava pkg init' 初始化项目", PROJECT_TOML_NAME);
     }
 
     let config = ProjectConfig::from_file(&toml_path)?;
@@ -214,13 +232,16 @@ fn cmd_build(project_dir: Option<&str>, force_fat: bool) -> anyhow::Result<()> {
     println!("找到 {} 个源文件", source_files.len());
 
     for file_path in &source_files {
-        compile_file_with_project(&file_path.to_string_lossy(), &project_root, &classes_dir)?;
+        compile_file_with_project(
+            &file_path.to_string_lossy(),
+            &project_root,
+            &classes_dir,
+        )?;
     }
 
-    let jar_path = project_root.join(&config.paths.output_dir).join(format!(
-        "{}-{}.jar",
-        config.project.name, config.project.version
-    ));
+    let jar_path = project_root
+        .join(&config.paths.output_dir)
+        .join(format!("{}-{}.jar", config.project.name, config.project.version));
 
     if let Some(parent) = jar_path.parent() {
         fs::create_dir_all(parent)?;
@@ -343,7 +364,6 @@ fn merge_jar_into_jar(
 }
 
 fn cmd_run(file: Option<&str>) -> anyhow::Result<()> {
-    // 优先尝试项目模式（类似 go run）
     let current_dir = std::env::current_dir()?;
     let toml_path = current_dir.join(PROJECT_TOML_NAME);
 
@@ -351,23 +371,17 @@ fn cmd_run(file: Option<&str>) -> anyhow::Result<()> {
         return run_project_mode();
     }
 
-    // 如果指定了文件，尝试从文件位置查找项目
     if let Some(f) = file {
         let file_path = Path::new(f);
         if let Ok((config, project_root)) = ProjectConfig::find_from_entry(file_path) {
             return run_project_mode_with_config(&config, &project_root);
         }
-        // 回退到单文件模式
         return run_single_file_mode(f);
     }
 
-    anyhow::bail!(
-        "未找到 {} 文件，请指定入口文件或先运行 'pava pkg init' 初始化项目",
-        PROJECT_TOML_NAME
-    )
+    anyhow::bail!("未找到 {} 文件，请指定入口文件或先运行 'pava pkg init' 初始化项目", PROJECT_TOML_NAME)
 }
 
-/// 项目模式运行：编译全部源文件，然后运行主类
 fn run_project_mode() -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
     let toml_path = current_dir.join(PROJECT_TOML_NAME);
@@ -378,7 +392,6 @@ fn run_project_mode() -> anyhow::Result<()> {
 fn run_project_mode_with_config(config: &ProjectConfig, project_root: &Path) -> anyhow::Result<()> {
     let classes_dir = config.get_classes_dir(project_root);
 
-    // 收集并编译所有源文件
     let mut source_files = Vec::new();
     for source_dir in &config.paths.source_dirs {
         let dir_path = project_root.join(source_dir);
@@ -395,7 +408,11 @@ fn run_project_mode_with_config(config: &ProjectConfig, project_root: &Path) -> 
     fs::create_dir_all(&classes_dir)?;
 
     for file_path in &source_files {
-        compile_file_with_project(&file_path.to_string_lossy(), project_root, &classes_dir)?;
+        compile_file_with_project(
+            &file_path.to_string_lossy(),
+            project_root,
+            &classes_dir,
+        )?;
     }
 
     let main_class = &config.build.main_class;
@@ -407,20 +424,15 @@ fn run_project_mode_with_config(config: &ProjectConfig, project_root: &Path) -> 
         .arg(main_class)
         .output()?;
 
-    // 实时输出 stdout
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.status.success() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        anyhow::bail!(
-            "程序运行失败 (退出码: {})",
-            output.status.code().unwrap_or(-1)
-        );
+        anyhow::bail!("程序运行失败 (退出码: {})", output.status.code().unwrap_or(-1));
     }
 
     Ok(())
 }
 
-/// 单文件模式运行：编译单个文件并运行
 fn run_single_file_mode(file: &str) -> anyhow::Result<()> {
     let source = fs::read_to_string(file)?;
     let unit = parser::parse_compilation_unit(&source)?;
@@ -435,7 +447,6 @@ fn run_single_file_mode(file: &str) -> anyhow::Result<()> {
             .to_string()
     };
 
-    // 编译到临时目录
     let temp_dir = std::env::temp_dir().join(format!("pava_run_{}", std::process::id()));
     fs::create_dir_all(&temp_dir)?;
 
@@ -457,7 +468,6 @@ fn run_single_file_mode(file: &str) -> anyhow::Result<()> {
 
     print!("{}", String::from_utf8_lossy(&output.stdout));
 
-    // 清理临时文件
     let _ = fs::remove_dir_all(&temp_dir);
 
     if !output.status.success() {
@@ -498,7 +508,8 @@ fn cmd_pkg_init(package_name: Option<&str>) -> anyhow::Result<()> {
              public static function main(): void {{\n        \
                  println(\"Hello from {}\");\n    \
              }}\n}}\n",
-        name, name
+        name,
+        name
     );
     fs::write("src/Main.pava", main_content)?;
 
