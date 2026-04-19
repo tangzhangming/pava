@@ -129,7 +129,7 @@ impl CodeGen {
     }
 
     pub fn generate(&mut self, class: Class) -> CompileResult<Vec<u8>> {
-        self.class_name = class.name.clone();
+        self.class_name = class.full_name.clone();
         self.parent_class_name = class.extends.clone();
 
         for field in &class.fields {
@@ -600,7 +600,7 @@ impl CodeGen {
         enum_val: &EnumValue,
         _ordinal: usize,
     ) -> CompileResult<()> {
-        let class_name = &class.name;
+        let class_name = &class.full_name;
         let class_idx = self.add_class_constant(class_name);
 
         self.code_buffer.push(0xBB);
@@ -926,7 +926,7 @@ impl CodeGen {
             self.emit_load_var(&promoted.name)?;
             let field_descriptor = promoted.param_type.to_jvm_descriptor();
             let field_idx =
-                self.add_fieldref_constant(&class.name, &promoted.name, &field_descriptor);
+                self.add_fieldref_constant(&class.full_name, &promoted.name, &field_descriptor);
             self.code_buffer.push(0xB5);
             self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
         }

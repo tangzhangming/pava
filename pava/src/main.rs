@@ -431,8 +431,7 @@ fn cmd_pkg_init(package_name: Option<&str>) -> anyhow::Result<()> {
              public static function main(): void {{\n        \
                  println(\"Hello from {}\");\n    \
              }}\n}}\n",
-        name.replace(".", "/"),
-        name
+        name, name
     );
     fs::write("src/Main.pava", main_content)?;
 
