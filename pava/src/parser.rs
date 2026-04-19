@@ -1,5 +1,5 @@
 use crate::ast::{
-    BinaryOp, CaptureVar, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
+    BinaryOp, CaptureVar, CatchClause, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
     EnumValue, Expr, Import, PromotedParam, Stmt, Type, UnaryOp,
 };
 use crate::error::{CompileError, CompileResult};
@@ -896,6 +896,42 @@ impl Parser {
         }
     }
 
+    fn parse_exception_type(&mut self) -> CompileResult<String> {
+        let mut parts = Vec::new();
+        match &self.current_token {
+            Token::Identifier(name) => {
+                parts.push(name.clone());
+                self.bump();
+            }
+            Token::Type(name) => {
+                parts.push(name.clone());
+                self.bump();
+            }
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected exception type name".to_string(),
+                ))
+            }
+        }
+
+        while self.current_token == Token::Dot {
+            self.bump();
+            match &self.current_token {
+                Token::Identifier(name) => {
+                    parts.push(name.clone());
+                    self.bump();
+                }
+                _ => {
+                    return Err(CompileError::ParserError(
+                        "Expected identifier after '.' in exception type".to_string(),
+                    ))
+                }
+            }
+        }
+
+        Ok(parts.join("/"))
+    }
+
     fn parse_block(&mut self) -> CompileResult<Vec<Stmt>> {
         let mut statements = Vec::new();
 
@@ -1087,6 +1123,70 @@ impl Parser {
                 self.bump();
                 self.expect(Token::Semicolon)?;
                 Ok(Stmt::Continue)
+            }
+            Token::Try => {
+                self.bump();
+                self.expect(Token::LBrace)?;
+                let try_body = self.parse_block()?;
+                self.expect(Token::RBrace)?;
+
+                let mut catch_clauses = Vec::new();
+                while self.current_token == Token::Catch {
+                    self.bump();
+                    self.expect(Token::LParen)?;
+
+                    let mut exception_types = Vec::new();
+                    let first_type = self.parse_exception_type()?;
+                    exception_types.push(first_type);
+
+                    while self.current_token == Token::Pipe {
+                        self.bump();
+                        let next_type = self.parse_exception_type()?;
+                        exception_types.push(next_type);
+                    }
+
+                    let var_name = match &self.current_token {
+                        Token::Variable(n) => n.clone(),
+                        _ => {
+                            return Err(CompileError::ParserError(
+                                "Expected variable name in catch clause".to_string(),
+                            ))
+                        }
+                    };
+                    self.bump();
+                    self.expect(Token::RParen)?;
+                    self.expect(Token::LBrace)?;
+                    let catch_body = self.parse_block()?;
+                    self.expect(Token::RBrace)?;
+
+                    catch_clauses.push(CatchClause {
+                        exception_types,
+                        var_name,
+                        body: catch_body,
+                    });
+                }
+
+                let finally_body = if self.current_token == Token::Finally {
+                    self.bump();
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_block()?;
+                    self.expect(Token::RBrace)?;
+                    Some(body)
+                } else {
+                    None
+                };
+
+                Ok(Stmt::TryCatch {
+                    try_body,
+                    catch_clauses,
+                    finally_body,
+                })
+            }
+            Token::Throw => {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.expect(Token::Semicolon)?;
+                Ok(Stmt::Expr(Expr::Throw(Box::new(expr))))
             }
             Token::Variable(_) => {
                 let expr = self.parse_expr()?;

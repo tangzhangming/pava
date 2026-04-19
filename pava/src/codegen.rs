@@ -30,6 +30,13 @@ struct LoopContext {
     break_patches: Vec<usize>,
 }
 
+struct ExceptionEntry {
+    start_pc: u16,
+    end_pc: u16,
+    handler_pc: u16,
+    catch_type: u16,
+}
+
 pub struct CodeGen {
     loop_stack: Vec<LoopContext>,
     class_fields: HashMap<String, Type>,
@@ -38,7 +45,7 @@ pub struct CodeGen {
     local_vars: HashMap<String, (u16, VarType)>,
     max_locals: u16,
     max_stack: u16,
-    current_stack: u16, // 当前栈深度
+    current_stack: u16,
     collected_integers: Vec<i32>,
     collected_longs: Vec<i64>,
     collected_floats: Vec<f32>,
@@ -58,6 +65,10 @@ pub struct CodeGen {
     class_name: String,
     parent_class_name: Option<String>,
     imports: Vec<String>,
+    exception_table: Vec<ExceptionEntry>,
+    stackmaptable_utf8_idx: u16,
+    throwable_class_idx: u16,
+    object_class_idx: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +136,10 @@ impl CodeGen {
             class_name: String::new(),
             parent_class_name: None,
             imports: Vec::new(),
+            exception_table: Vec::new(),
+            stackmaptable_utf8_idx: 0,
+            throwable_class_idx: 0,
+            object_class_idx: 0,
         }
     }
 
@@ -212,6 +227,25 @@ impl CodeGen {
                     self.collect_constants_from_expr(arg);
                 }
             }
+            Stmt::TryCatch {
+                try_body,
+                catch_clauses,
+                finally_body,
+            } => {
+                for s in try_body {
+                    self.collect_constants_from_stmt(s);
+                }
+                for catch in catch_clauses {
+                    for s in &catch.body {
+                        self.collect_constants_from_stmt(s);
+                    }
+                }
+                if let Some(finally_stmts) = finally_body {
+                    for s in finally_stmts {
+                        self.collect_constants_from_stmt(s);
+                    }
+                }
+            }
         }
     }
 
@@ -287,6 +321,13 @@ impl CodeGen {
 
         let obj_utf8 = add(ConstantPoolEntry::Utf8("java/lang/Object".to_string()));
         let obj_class = add(ConstantPoolEntry::Class(obj_utf8));
+        self.object_class_idx = obj_class;
+
+        let throwable_utf8 = add(ConstantPoolEntry::Utf8("java/lang/Throwable".to_string()));
+        self.throwable_class_idx = add(ConstantPoolEntry::Class(throwable_utf8));
+
+        let stackmaptable_utf8 = add(ConstantPoolEntry::Utf8("StackMapTable".to_string()));
+        self.stackmaptable_utf8_idx = stackmaptable_utf8;
 
         let class_utf8 = add(ConstantPoolEntry::Utf8(class.full_name.clone()));
         let class_class = add(ConstantPoolEntry::Class(class_utf8));
@@ -695,10 +736,11 @@ impl CodeGen {
 
         bytes.extend_from_slice(&1u16.to_be_bytes());
 
-        self.emit_method_code(bytes, method)
+        self.emit_method_code(bytes, method)?;
+        Ok(())
     }
 
-    fn build_method_descriptor(&mut self, method: &ClassMethod) -> String {
+    fn build_method_descriptor(&self, method: &ClassMethod) -> String {
         let mut desc = String::from("(");
         for (_, param_type) in &method.params {
             desc.push_str(&param_type.to_jvm_descriptor());
@@ -712,6 +754,7 @@ impl CodeGen {
         self.code_buffer.clear();
         self.local_vars.clear();
         self.max_locals = 1;
+        self.exception_table.clear();
 
         if !method.is_static {
             self.local_vars
@@ -728,6 +771,8 @@ impl CodeGen {
             self.max_locals += slots;
             self.local_vars.insert(param_name.clone(), (idx, var_type));
         }
+
+        let initial_locals = self.max_locals;
 
         for stmt in &method.body {
             self.emit_stmt(stmt)?;
@@ -750,37 +795,79 @@ impl CodeGen {
             }
         }
 
-        let code_idx = self.find_utf8_index("Code").unwrap_or(10);
-        let code_attr_len = 12 + self.code_buffer.len() as u32;
+self.emit_method_code_bytes(bytes, initial_locals)?;
+        Ok(())
+    }
 
-        // 估算 max_stack：基于字节码中特定指令的数量
-        // 这是一个简化的估算方法
-        let mut new_count = 0u16; // new 指令数量
-        let mut ldc_count = 0u16; // ldc 指令数量
-        for byte in &self.code_buffer {
-            match byte {
-                0xbb => new_count += 1,        // new
-                0x12 | 0x13 => ldc_count += 1, // ldc/ldc_w
-                _ => {}
+    fn build_stack_map_table(&self, initial_locals: u16) -> Vec<u8> {
+        let mut result = Vec::new();
+        if self.exception_table.is_empty() {
+            return result;
+        }
+
+        let mut handlers: Vec<u16> = self.exception_table.iter()
+            .map(|e| e.handler_pc)
+            .collect();
+        handlers.sort();
+        handlers.dedup();
+
+        if handlers.is_empty() {
+            return result;
+        }
+
+        let num_entries = handlers.len() as u16;
+        result.extend_from_slice(&num_entries.to_be_bytes());
+
+        let mut prev_offset = 0u16;
+        for handler_pc in handlers {
+            let offset_delta = if prev_offset == 0 {
+                handler_pc
+            } else {
+                handler_pc - prev_offset + 1
+            };
+            prev_offset = handler_pc;
+
+            result.push(255);
+            result.extend_from_slice(&offset_delta.to_be_bytes());
+            
+            result.extend_from_slice(&initial_locals.to_be_bytes());
+            for idx in 0..initial_locals {
+                let var_type = self.get_local_var_type(idx);
+                match var_type {
+                    VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => {
+                        result.push(1);
+                    }
+                    VarType::Long => {
+                        result.push(4);
+                    }
+                    VarType::Float => {
+                        result.push(2);
+                    }
+                    VarType::Double => {
+                        result.push(3);
+                    }
+                    VarType::String | VarType::Ref | VarType::ObjectRef(_) => {
+                        result.push(7);
+                        result.extend_from_slice(&self.object_class_idx.to_be_bytes());
+                    }
+                }
+            }
+            
+            result.extend_from_slice(&1u16.to_be_bytes());
+            result.push(7);
+            result.extend_from_slice(&self.throwable_class_idx.to_be_bytes());
+        }
+
+        result
+    }
+
+    fn get_local_var_type(&self, idx: u16) -> VarType {
+        for (_, (i, t)) in &self.local_vars {
+            if *i == idx {
+                return t.clone();
             }
         }
-        // 基础栈深度 + new/dup 对 + ldc
-        let estimated_stack = 2 + (new_count * 2) + ldc_count;
-        let estimated_stack = estimated_stack.min(64).max(2);
-
-        bytes.extend_from_slice(&code_idx.to_be_bytes());
-        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
-        bytes.extend_from_slice(&estimated_stack.to_be_bytes());
-        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
-
-        let code_len = self.code_buffer.len() as u32;
-        bytes.extend_from_slice(&code_len.to_be_bytes());
-        bytes.extend_from_slice(&self.code_buffer);
-
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-
-        Ok(())
+        VarType::Ref
     }
 
     fn type_to_var_type(&self, ty: &Type) -> VarType {
@@ -1010,7 +1097,6 @@ impl CodeGen {
     fn emit_main_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
         let main_idx = self.add_utf8_constant("main");
         let main_desc_idx = self.add_utf8_constant("([Ljava/lang/String;)V");
-        let code_idx = self.add_utf8_constant("Code");
 
         bytes.extend_from_slice(&(ACC_PUBLIC | ACC_STATIC).to_be_bytes());
         bytes.extend_from_slice(&main_idx.to_be_bytes());
@@ -1018,6 +1104,13 @@ impl CodeGen {
         bytes.extend_from_slice(&1u16.to_be_bytes());
 
         self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_locals = 1;
+        self.exception_table.clear();
+
+        self.local_vars.insert("args".to_string(), (0, VarType::Ref));
+
+        let initial_locals = self.max_locals;
 
         for method in &class.methods {
             if method.name == "main" {
@@ -1032,18 +1125,64 @@ impl CodeGen {
             self.code_buffer.push(0xB1);
         }
 
-        let code_attr_len = 12 + self.code_buffer.len() as u32;
+        self.emit_method_code_bytes(bytes, initial_locals)?;
+        Ok(())
+    }
+
+    fn emit_method_code_bytes(&mut self, bytes: &mut Vec<u8>, initial_locals: u16) -> CompileResult<()> {
+        let code_idx = self.find_utf8_index("Code").unwrap_or(10);
+        let exception_table_len = self.exception_table.len() as u16;
+
+        let stack_map_table = self.build_stack_map_table(initial_locals);
+        let has_stack_map = !stack_map_table.is_empty();
+        let attr_count: u16 = if has_stack_map { 1 } else { 0 };
+
+        let stack_map_attr_content_len = if has_stack_map {
+            stack_map_table.len() as u32
+        } else {
+            0
+        };
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32 
+            + exception_table_len as u32 * 8 
+            + attr_count as u32 * 6
+            + stack_map_attr_content_len;
+
+        let mut new_count = 0u16;
+        let mut ldc_count = 0u16;
+        for byte in &self.code_buffer {
+            match byte {
+                0xbb => new_count += 1,
+                0x12 | 0x13 => ldc_count += 1,
+                _ => {}
+            }
+        }
+        let estimated_stack = 2 + (new_count * 2) + ldc_count;
+        let estimated_stack = estimated_stack.min(64).max(2);
+
         bytes.extend_from_slice(&code_idx.to_be_bytes());
         bytes.extend_from_slice(&code_attr_len.to_be_bytes());
-        bytes.extend_from_slice(&5u16.to_be_bytes());
-        bytes.extend_from_slice(&20u16.to_be_bytes());
+        bytes.extend_from_slice(&estimated_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
 
         let code_len = self.code_buffer.len() as u32;
         bytes.extend_from_slice(&code_len.to_be_bytes());
         bytes.extend_from_slice(&self.code_buffer);
 
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&exception_table_len.to_be_bytes());
+        for entry in &self.exception_table {
+            bytes.extend_from_slice(&entry.start_pc.to_be_bytes());
+            bytes.extend_from_slice(&entry.end_pc.to_be_bytes());
+            bytes.extend_from_slice(&entry.handler_pc.to_be_bytes());
+            bytes.extend_from_slice(&entry.catch_type.to_be_bytes());
+        }
+
+        bytes.extend_from_slice(&attr_count.to_be_bytes());
+        if has_stack_map {
+            bytes.extend_from_slice(&self.stackmaptable_utf8_idx.to_be_bytes());
+            bytes.extend_from_slice(&stack_map_attr_content_len.to_be_bytes());
+            bytes.extend_from_slice(&stack_map_table);
+        }
 
         Ok(())
     }
@@ -1073,8 +1212,114 @@ impl CodeGen {
                 }
             }
             Stmt::Printf(_, _) => {}
+            Stmt::TryCatch {
+                try_body,
+                catch_clauses,
+                finally_body,
+            } => self.emit_try_catch(try_body, catch_clauses, finally_body)?,
         }
         Ok(())
+    }
+
+    fn emit_try_catch(
+        &mut self,
+        try_body: &[Stmt],
+        catch_clauses: &[CatchClause],
+        finally_body: &Option<Vec<Stmt>>,
+    ) -> CompileResult<()> {
+        let try_start = self.code_buffer.len() as u16;
+
+        for stmt in try_body {
+            self.emit_stmt(stmt)?;
+        }
+
+        let try_end = self.code_buffer.len() as u16;
+
+        self.code_buffer.push(0xA7);
+        let jump_after_try_patch = self.code_buffer.len();
+        self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut catch_jump_patches = Vec::new();
+
+        for catch in catch_clauses {
+            let handler_pc = self.code_buffer.len() as u16;
+
+            let var_idx = self.max_locals;
+            self.max_locals += 1;
+            self.local_vars.insert(catch.var_name.clone(), (var_idx, VarType::Ref));
+
+            self.code_buffer.push(0x59);
+
+            for stmt in &catch.body {
+                self.emit_stmt(stmt)?;
+            }
+
+            for exc_type in &catch.exception_types {
+                let normalized_type = self.normalize_exception_type(exc_type);
+                let catch_type_idx = self.add_class_constant(&normalized_type);
+                self.exception_table.push(ExceptionEntry {
+                    start_pc: try_start,
+                    end_pc: try_end,
+                    handler_pc,
+                    catch_type: catch_type_idx,
+                });
+            }
+
+            self.code_buffer.push(0xA7);
+            let patch_pos = self.code_buffer.len();
+            self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+            catch_jump_patches.push(patch_pos);
+        }
+
+        if let Some(finally_stmts) = finally_body {
+            let finally_start = self.code_buffer.len() as u16;
+
+            if catch_clauses.is_empty() {
+                self.exception_table.push(ExceptionEntry {
+                    start_pc: try_start,
+                    end_pc: try_end,
+                    handler_pc: finally_start,
+                    catch_type: 0,
+                });
+            }
+
+            for stmt in finally_stmts {
+                self.emit_stmt(stmt)?;
+            }
+        }
+
+        let exit_pos = self.code_buffer.len() as u16;
+
+        let offset = (exit_pos as i32 - (jump_after_try_patch - 1) as i32) as i16;
+        self.code_buffer[jump_after_try_patch..jump_after_try_patch + 2]
+            .copy_from_slice(&offset.to_be_bytes());
+
+        for patch_pos in catch_jump_patches {
+            let offset = (exit_pos as i32 - (patch_pos - 1) as i32) as i16;
+            self.code_buffer[patch_pos..patch_pos + 2].copy_from_slice(&offset.to_be_bytes());
+        }
+
+        Ok(())
+    }
+
+    fn normalize_exception_type(&self, exc_type: &str) -> String {
+        if exc_type.contains('/') || exc_type.contains('.') {
+            return exc_type.replace('.', "/");
+        }
+        match exc_type {
+            "Exception" => "java/lang/Exception",
+            "RuntimeException" => "java/lang/RuntimeException",
+            "IllegalArgumentException" => "java/lang/IllegalArgumentException",
+            "ArithmeticException" => "java/lang/ArithmeticException",
+            "NullPointerException" => "java/lang/NullPointerException",
+            "IndexOutOfBoundsException" => "java/lang/IndexOutOfBoundsException",
+            "ArrayIndexOutOfBoundsException" => "java/lang/ArrayIndexOutOfBoundsException",
+            "ClassCastException" => "java/lang/ClassCastException",
+            "NumberFormatException" => "java/lang/NumberFormatException",
+            "IOException" => "java/io/IOException",
+            "FileNotFoundException" => "java/io/FileNotFoundException",
+            _ => exc_type,
+        }.to_string()
     }
 
     fn emit_typed_assign(&mut self, name: &str, ty: &Type, expr: &Expr) -> CompileResult<()> {
@@ -1151,6 +1396,11 @@ impl CodeGen {
                 self.emit_null_coalescing(value, default_expr)?
             }
             Expr::InstanceOf(expr, class_name) => self.emit_instanceof(expr, class_name)?,
+            Expr::Throw(expr) => {
+                self.emit_expr(expr)?;
+                self.code_buffer.push(0xBF);
+                self.update_max_stack(-1);
+            }
         }
         Ok(())
     }
@@ -1252,6 +1502,11 @@ impl CodeGen {
     }
 
     fn emit_load_var(&mut self, name: &str) -> CompileResult<()> {
+        if name == "this" {
+            self.code_buffer.push(0x2A);
+            self.update_max_stack(1);
+            return Ok(());
+        }
         if let Some(&(idx, ty)) = self.local_vars.get(name) {
             match ty {
                 VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => match idx {
@@ -1625,6 +1880,7 @@ impl CodeGen {
 
     fn type_to_jvm_category(&self, ty: &Type) -> JvmCategory {
         match ty {
+            Type::Nothing => JvmCategory::Ref,
             Type::Boolean | Type::Int8 | Type::Int16 | Type::Int32 => JvmCategory::Int,
             Type::Int64 => JvmCategory::Long,
             Type::Float32 => JvmCategory::Float,
@@ -2420,31 +2676,61 @@ impl CodeGen {
 
     /// 解析类名，考虑 import 和当前 package
     fn resolve_class_name(&self, class_name: &str) -> String {
-        // 先检查是否是已知的 Java 类
-        if class_name.starts_with("java/") || class_name.starts_with("javax/") {
-            return class_name.to_string();
+        if class_name == "this" {
+            return self.class_name.clone();
         }
-
-        // 检查 import 列表
-        for import in &self.imports {
-            // 提取 import 的最后一部分
-            if let Some(pos) = import.rfind('/') {
-                let simple_name = &import[pos + 1..];
-                if simple_name == class_name {
-                    return import.clone();
+        if class_name.contains('/') || class_name.contains('.') {
+            return class_name.replace('.', "/");
+        }
+        match class_name {
+            "Object" => "java/lang/Object",
+            "String" => "java/lang/String",
+            "Integer" => "java/lang/Integer",
+            "Long" => "java/lang/Long",
+            "Double" => "java/lang/Double",
+            "Float" => "java/lang/Float",
+            "Boolean" => "java/lang/Boolean",
+            "Exception" => "java/lang/Exception",
+            "RuntimeException" => "java/lang/RuntimeException",
+            "IllegalArgumentException" => "java/lang/IllegalArgumentException",
+            "ArithmeticException" => "java/lang/ArithmeticException",
+            "NullPointerException" => "java/lang/NullPointerException",
+            "IndexOutOfBoundsException" => "java/lang/IndexOutOfBoundsException",
+            "ArrayIndexOutOfBoundsException" => "java/lang/ArrayIndexOutOfBoundsException",
+            "ClassCastException" => "java/lang/ClassCastException",
+            "NumberFormatException" => "java/lang/NumberFormatException",
+            "IOException" => "java/io/IOException",
+            "FileNotFoundException" => "java/io/FileNotFoundException",
+            "Thread" => "java/lang/Thread",
+            "Runnable" => "java/lang/Runnable",
+            "List" => "java/util/List",
+            "ArrayList" => "java/util/ArrayList",
+            "HashMap" => "java/util/HashMap",
+            "Map" => "java/util/Map",
+            "Set" => "java/util/Set",
+            "HashSet" => "java/util/HashSet",
+            "System" => "java/lang/System",
+            "Math" => "java/lang/Math",
+            _ => {
+                if class_name.starts_with("java/") || class_name.starts_with("javax/") {
+                    return class_name.to_string();
                 }
-            } else if import == class_name {
-                return import.clone();
+                for import in &self.imports {
+                    if let Some(pos) = import.rfind('/') {
+                        let simple_name = &import[pos + 1..];
+                        if simple_name == class_name {
+                            return import.clone();
+                        }
+                    } else if import == class_name {
+                        return import.clone();
+                    }
+                }
+                if let Some(pkg) = self.class_name.rfind('/') {
+                    return format!("{}/{}", &self.class_name[..pkg], class_name);
+                }
+                return class_name.to_string();
             }
-        }
-
-        // 检查是否是当前 package 中的类
-        if let Some(pkg) = self.class_name.rfind('/') {
-            return format!("{}/{}", &self.class_name[..pkg], class_name);
-        }
-
-        // 默认返回原始名称
-        class_name.to_string()
+        }.to_string()
     }
 
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {

@@ -51,6 +51,7 @@ pub struct CompilationUnit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
+    Nothing,
     String,
     Boolean,
     Int8,
@@ -68,6 +69,7 @@ pub enum Type {
 impl Type {
     pub fn to_jvm_descriptor(&self) -> String {
         match self {
+            Type::Nothing => "Ljava/lang/Object;".to_string(),
             Type::String => "Ljava/lang/String;".to_string(),
             Type::Boolean => "Z".to_string(),
             Type::Int8 => "B".to_string(),
@@ -225,6 +227,7 @@ pub enum Expr {
     Elvis(Box<Expr>, Box<Expr>),              // $a ?: $c (when $a is truthy, return $a; else $c)
     NullCoalescing(Box<Expr>, Box<Expr>),     // $a ?? $c (when $a is null, return $c; else $a)
     InstanceOf(Box<Expr>, String),            // $obj instanceof ClassName
+    Throw(Box<Expr>),                         // throw $expr
     NewObject(String, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     StaticCall(String, String, Vec<Expr>),
@@ -298,4 +301,16 @@ pub enum Stmt {
     Println(Expr),
     Printf(Expr, Vec<Expr>),
     Block(Vec<Stmt>),
+    TryCatch {
+        try_body: Vec<Stmt>,
+        catch_clauses: Vec<CatchClause>,
+        finally_body: Option<Vec<Stmt>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CatchClause {
+    pub exception_types: Vec<String>,
+    pub var_name: String,
+    pub body: Vec<Stmt>,
 }

@@ -70,28 +70,32 @@ impl TypeContext {
 }
 
 pub fn resolve_type(type_name: &str) -> Option<Type> {
-    match type_name {
-        "string" | "String" => Some(Type::String),
-        "boolean" | "bool" => Some(Type::Boolean),
-        "int8" => Some(Type::Int8),
-        "int16" => Some(Type::Int16),
-        "int32" => Some(Type::Int32),
-        "int64" => Some(Type::Int64),
-        "float32" => Some(Type::Float32),
-        "float64" => Some(Type::Float64),
-        "byte" => Some(Type::Int8),
-        "int" => Some(Type::Int64),
-        "float" => Some(Type::Float64),
-        "void" => Some(Type::Void),
-        _ => None,
+        match type_name {
+            "Nothing" | "nothing" => Some(Type::Nothing),
+            "string" | "String" => Some(Type::String),
+            "boolean" | "bool" => Some(Type::Boolean),
+            "int8" => Some(Type::Int8),
+            "int16" => Some(Type::Int16),
+            "int32" => Some(Type::Int32),
+            "int64" => Some(Type::Int64),
+            "float32" => Some(Type::Float32),
+            "float64" => Some(Type::Float64),
+            "byte" => Some(Type::Int8),
+            "int" => Some(Type::Int64),
+            "float" => Some(Type::Float64),
+            "void" => Some(Type::Void),
+            _ => None,
+        }
     }
-}
 
 pub fn is_assignable(from: &Type, to: &Type) -> bool {
-    if from.is_nullable() && !to.is_nullable() {
-        return false;
-    }
-    match (from, to) {
+        if matches!(from, Type::Nothing) {
+            return true;
+        }
+        if from.is_nullable() && !to.is_nullable() {
+            return false;
+        }
+        match (from, to) {
         (Type::Int8, Type::Int8) => true,
         (Type::Int8, Type::Int16) => true,
         (Type::Int8, Type::Int32) => true,
@@ -175,6 +179,7 @@ pub fn infer_expr_type(expr: &Expr) -> Type {
         Expr::InstanceOf(_, _) => Type::Boolean,
         Expr::Cast(_, target_type) => target_type.clone(),
         Expr::NewObject(class_name, _) => Type::Object(class_name.clone()),
+        Expr::Throw(_) => Type::Nothing,
         _ => Type::String,
     }
 }

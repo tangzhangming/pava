@@ -43,6 +43,10 @@ pub enum Token {
     Internal, // 模块内可见性修饰符
     Package,
     Import,
+    Try,
+    Catch,
+    Throw,
+    Finally,
 
     // Types
     Type(String),
@@ -457,6 +461,10 @@ impl Lexer {
             "internal" => Token::Internal,
             "package" => Token::Package,
             "import" => Token::Import,
+            "try" => Token::Try,
+            "catch" => Token::Catch,
+            "throw" => Token::Throw,
+            "finally" => Token::Finally,
             "instanceof" => Token::Instanceof,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,
