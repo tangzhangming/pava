@@ -69,6 +69,7 @@ pub struct CodeGen {
     stackmaptable_utf8_idx: u16,
     throwable_class_idx: u16,
     object_class_idx: u16,
+    branch_targets: Vec<u16>, // 记录所有分支跳转目标位置，用于StackMapTable
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +141,7 @@ impl CodeGen {
             stackmaptable_utf8_idx: 0,
             throwable_class_idx: 0,
             object_class_idx: 0,
+            branch_targets: Vec::new(),
         }
     }
 
@@ -755,6 +757,7 @@ impl CodeGen {
         self.local_vars.clear();
         self.max_locals = 1;
         self.exception_table.clear();
+        self.branch_targets.clear();
 
         if !method.is_static {
             self.local_vars
@@ -801,61 +804,70 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
 
     fn build_stack_map_table(&self, initial_locals: u16) -> Vec<u8> {
         let mut result = Vec::new();
-        if self.exception_table.is_empty() {
-            return result;
-        }
-
-        let mut handlers: Vec<u16> = self.exception_table.iter()
+        
+        // 收集所有需要stackmap frame的位置：异常处理器 + 分支目标
+        let mut all_targets: Vec<u16> = self.exception_table.iter()
             .map(|e| e.handler_pc)
             .collect();
-        handlers.sort();
-        handlers.dedup();
-
-        if handlers.is_empty() {
+        all_targets.extend(&self.branch_targets);
+        
+        if all_targets.is_empty() {
             return result;
         }
+        
+        all_targets.sort();
+        all_targets.dedup();
 
-        let num_entries = handlers.len() as u16;
+        let num_entries = all_targets.len() as u16;
         result.extend_from_slice(&num_entries.to_be_bytes());
 
         let mut prev_offset = 0u16;
-        for handler_pc in handlers {
+        for target_pc in all_targets {
             let offset_delta = if prev_offset == 0 {
-                handler_pc
+                target_pc
             } else {
-                handler_pc - prev_offset + 1
+                target_pc - prev_offset - 1
             };
-            prev_offset = handler_pc;
+            prev_offset = target_pc;
 
-            result.push(255);
+            result.push(255); // full_frame
             result.extend_from_slice(&offset_delta.to_be_bytes());
             
+            // 局部变量表
             result.extend_from_slice(&initial_locals.to_be_bytes());
             for idx in 0..initial_locals {
                 let var_type = self.get_local_var_type(idx);
                 match var_type {
                     VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => {
-                        result.push(1);
+                        result.push(1); // INTEGER
                     }
                     VarType::Long => {
-                        result.push(4);
+                        result.push(4); // LONG
                     }
                     VarType::Float => {
-                        result.push(2);
+                        result.push(2); // FLOAT
                     }
                     VarType::Double => {
-                        result.push(3);
+                        result.push(3); // DOUBLE
                     }
                     VarType::String | VarType::Ref | VarType::ObjectRef(_) => {
-                        result.push(7);
+                        result.push(7); // OBJECT
                         result.extend_from_slice(&self.object_class_idx.to_be_bytes());
                     }
                 }
             }
             
-            result.extend_from_slice(&1u16.to_be_bytes());
-            result.push(7);
-            result.extend_from_slice(&self.throwable_class_idx.to_be_bytes());
+            // 操作数栈：检查这个位置是否是异常处理器
+            let is_handler = self.exception_table.iter().any(|e| e.handler_pc == target_pc);
+            if is_handler {
+                // 异常处理器入口： astore执行前，栈顶有一个Throwable（JVM压入的）
+                result.extend_from_slice(&1u16.to_be_bytes());
+                result.push(7); // OBJECT
+                result.extend_from_slice(&self.throwable_class_idx.to_be_bytes());
+            } else {
+                // 普通分支目标（如catch后的代码）：栈为空
+                result.extend_from_slice(&0u16.to_be_bytes());
+            }
         }
 
         result
@@ -1107,6 +1119,7 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         self.local_vars.clear();
         self.max_locals = 1;
         self.exception_table.clear();
+        self.branch_targets.clear();
 
         self.local_vars.insert("args".to_string(), (0, VarType::Ref));
 
@@ -1248,7 +1261,9 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
             self.max_locals += 1;
             self.local_vars.insert(catch.var_name.clone(), (var_idx, VarType::Ref));
 
-            self.code_buffer.push(0x59);
+            // 将异常对象存储到局部变量: astore <var_idx>
+            self.code_buffer.push(0x3A);
+            self.code_buffer.push(var_idx as u8);
 
             for stmt in &catch.body {
                 self.emit_stmt(stmt)?;
@@ -1289,6 +1304,9 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         }
 
         let exit_pos = self.code_buffer.len() as u16;
+
+        // 记录 exit_pos 作为分支目标（所有catch块都会跳转到这里）
+        self.branch_targets.push(exit_pos);
 
         let offset = (exit_pos as i32 - (jump_after_try_patch - 1) as i32) as i16;
         self.code_buffer[jump_after_try_patch..jump_after_try_patch + 2]
