@@ -585,17 +585,24 @@ impl Parser {
 
         let name = match &self.current_token {
             Token::Variable(n) => n.trim_start_matches('$').to_string(),
-            Token::Identifier(n) => n.clone(),
             _ => {
                 return Err(CompileError::ParserError(format!(
-                    "Expected field name, got {:?}",
+                    "Expected field name (must start with $), got {:?}",
                     self.current_token
                 )))
             }
         };
         self.bump();
 
-        // Check for property hooks: { get; set; } or { get { ... } set { ... } }
+        // Check for initializer before property hooks: type $name = value { get; set; }
+        let mut initializer = if self.current_token == Token::Equal {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // Check for property hooks: { get; set; } or { get { ... } set(string $value) { ... } }
         let mut property_hooks = Vec::new();
         if self.current_token == Token::LBrace {
             self.bump(); // consume '{'
@@ -604,12 +611,12 @@ impl Parser {
                 match &self.current_token {
                     Token::Get => {
                         self.bump(); // consume 'get'
-                        let hook = self.parse_property_hook(PropertyHookType::Get)?;
+                        let hook = self.parse_property_hook(PropertyHookType::Get, &field_type)?;
                         property_hooks.push(hook);
                     }
                     Token::Set => {
                         self.bump(); // consume 'set'
-                        let hook = self.parse_property_hook(PropertyHookType::Set)?;
+                        let hook = self.parse_property_hook(PropertyHookType::Set, &field_type)?;
                         property_hooks.push(hook);
                     }
                     _ => {
@@ -624,12 +631,11 @@ impl Parser {
             self.expect(Token::RBrace)?; // consume '}'
         }
 
-        let initializer = if self.current_token == Token::Equal {
+        // Also support initializer after property hooks: type $name { get; set; } = value
+        if initializer.is_none() && self.current_token == Token::Equal {
             self.bump();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+            initializer = Some(self.parse_expr()?);
+        }
 
         if self.current_token == Token::Semicolon {
             self.bump();
@@ -650,13 +656,15 @@ impl Parser {
         })
     }
 
-    fn parse_property_hook(&mut self, hook_type: PropertyHookType) -> CompileResult<PropertyHook> {
+    fn parse_property_hook(&mut self, hook_type: PropertyHookType, field_type: &Type) -> CompileResult<PropertyHook> {
         // Check if it's a short form: get; or set;
         if self.current_token == Token::Semicolon {
             self.bump(); // consume ';'
             return Ok(PropertyHook {
                 hook_type,
                 body: Vec::new(), // Empty body means auto-generated
+                param_type: None,
+                param_name: None,
             });
         }
         
@@ -668,10 +676,58 @@ impl Parser {
             return Ok(PropertyHook {
                 hook_type,
                 body: vec![Stmt::Return(Some(expr))],
+                param_type: None,
+                param_name: None,
             });
         }
         
-        // Full block form: get { ... }
+        // For setter, check if it has parameter type: set(string $value) { ... }
+        let mut param_type = None;
+        let mut param_name = None;
+        
+        if hook_type == PropertyHookType::Set && self.current_token != Token::LBrace {
+            // Check if it's set(string $value) form with parentheses
+            if self.current_token == Token::LParen {
+                self.bump(); // consume '('
+                
+                // Parse optional parameter type
+                let is_type_token = matches!(
+                    &self.current_token,
+                    Token::Type(_)
+                        | Token::TypeInt8
+                        | Token::TypeInt16
+                        | Token::TypeInt32
+                        | Token::TypeInt64
+                        | Token::TypeFloat32
+                        | Token::TypeFloat64
+                        | Token::TypeBoolean
+                        | Token::TypeByte
+                        | Token::TypeInt
+                        | Token::TypeFloat
+                );
+                
+                if is_type_token {
+                    param_type = Some(self.parse_type()?);
+                }
+                
+                // Parse parameter name (must start with $)
+                param_name = match &self.current_token {
+                    Token::Variable(n) => {
+                        let name = n.trim_start_matches('$').to_string();
+                        self.bump();
+                        Some(name)
+                    }
+                    _ => {
+                        // If no explicit parameter name, use "value" as default
+                        Some("value".to_string())
+                    }
+                };
+                
+                self.expect(Token::RParen)?; // consume ')'
+            }
+        }
+        
+        // Full block form: get { ... } or set(string $value) { ... }
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -679,6 +735,8 @@ impl Parser {
         Ok(PropertyHook {
             hook_type,
             body,
+            param_type,
+            param_name,
         })
     }
 

@@ -44,6 +44,8 @@ pub struct CodeGen {
     class_fields: HashMap<String, Type>,
     class_methods: HashMap<String, Type>, // 方法名 -> 返回类型
     property_hook_fields: HashSet<String>, // 记录哪些字段有 property hooks
+    in_property_hook: bool, // 是否在生成property hook方法（getter/setter）
+    current_property_field: Option<String>, // 当前正在生成的property字段名
     constant_pool: Vec<ConstantPoolEntry>,
     code_buffer: Vec<u8>,
     local_vars: HashMap<String, (u16, VarType)>,
@@ -118,6 +120,8 @@ impl CodeGen {
             class_fields: HashMap::new(),
             class_methods: HashMap::new(),
             property_hook_fields: HashSet::new(),
+            in_property_hook: false,
+            current_property_field: None,
             constant_pool: Vec::new(),
             code_buffer: Vec::new(),
             local_vars: HashMap::new(),
@@ -460,7 +464,7 @@ impl CodeGen {
         } else if class.constructor.is_some() {
             self.emit_constructor_method(&mut method_bytes, class)?;
         } else {
-            self.emit_init_method(&mut method_bytes);
+            self.emit_init_method(&mut method_bytes, class)?;
         }
 
         // 生成 clinit 方法
@@ -559,8 +563,14 @@ impl CodeGen {
         }
 
         // 计算属性挂钩方法数量
+        // Each hook generates one method, plus we may generate a default getter for fields with only setter
         let property_methods_count: usize = class.fields.iter()
-            .map(|f| f.property_hooks.len())
+            .map(|f| {
+                let has_getter = f.property_hooks.iter().any(|h| h.hook_type == PropertyHookType::Get);
+                let has_setter = f.property_hooks.iter().any(|h| h.hook_type == PropertyHookType::Set);
+                let extra_getter = if has_setter && !has_getter { 1 } else { 0 };
+                f.property_hooks.len() + extra_getter
+            })
             .sum();
         
         let method_count = class.methods.len() as u16 
@@ -1013,34 +1023,57 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         }
     }
 
-    fn emit_init_method(&mut self, bytes: &mut Vec<u8>) {
-        let init_idx = self.find_utf8_index("<init>").unwrap_or(6);
-        let void_desc_idx = self.find_utf8_index("()V").unwrap_or(7);
-        let code_idx = self.find_utf8_index("Code").unwrap_or(10);
-        let object_init_idx = self
-            .find_methodref_index("java/lang/Object", "<init>")
-            .unwrap_or(9);
+    fn emit_init_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
+        let init_idx = self.add_utf8_constant("<init>");
+        let void_desc_idx = self.add_utf8_constant("()V");
+        let code_idx = self.add_utf8_constant("Code");
+        let parent_class = class.extends.clone().unwrap_or_else(|| "java/lang/Object".to_string());
+        let parent_init_idx = self.add_methodref_constant(&parent_class, "<init>", "()V");
 
         bytes.extend_from_slice(&ACC_PUBLIC.to_be_bytes());
         bytes.extend_from_slice(&init_idx.to_be_bytes());
         bytes.extend_from_slice(&void_desc_idx.to_be_bytes());
         bytes.extend_from_slice(&1u16.to_be_bytes());
 
-        let code_attr_len = 17u32;
+        self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_stack = 2;
+        self.max_locals = 1;
+        self.local_vars.insert("this".to_string(), (0, VarType::Ref));
+
+        // Call super.<init>()
+        self.code_buffer.push(0x2A); // aload_0
+        self.code_buffer.push(0xB7); // invokespecial
+        self.code_buffer.extend_from_slice(&parent_init_idx.to_be_bytes());
+
+        // Initialize fields with initializers (including property hook fields)
+        for field in &class.fields {
+            if let Some(ref initializer) = field.initializer {
+                self.code_buffer.push(0x2A); // aload_0
+                self.emit_expr(initializer)?;
+                let field_descriptor = field.field_type.to_jvm_descriptor();
+                let field_idx = self.add_fieldref_constant(&class.full_name, &field.name, &field_descriptor);
+                self.code_buffer.push(0xB5); // putfield
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
+        }
+
+        self.code_buffer.push(0xB1); // return
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32;
         bytes.extend_from_slice(&code_idx.to_be_bytes());
         bytes.extend_from_slice(&code_attr_len.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&self.max_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
 
-        bytes.extend_from_slice(&5u32.to_be_bytes());
+        let code_len = self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+        bytes.extend_from_slice(&self.code_buffer);
 
-        bytes.push(0x2A);
-        bytes.push(0xB7);
-        bytes.extend_from_slice(&object_init_idx.to_be_bytes());
-        bytes.push(0xB1);
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
 
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        Ok(())
     }
 
     fn emit_constructor_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
@@ -1098,6 +1131,18 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                 self.add_fieldref_constant(&class.full_name, &promoted.name, &field_descriptor);
             self.code_buffer.push(0xB5);
             self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+        }
+
+        // Initialize fields with initializers (if not already done in constructor body)
+        for field in &class.fields {
+            if let Some(ref initializer) = field.initializer {
+                self.code_buffer.push(0x2A); // aload_0
+                self.emit_expr(initializer)?;
+                let field_descriptor = field.field_type.to_jvm_descriptor();
+                let field_idx = self.add_fieldref_constant(&class.full_name, &field.name, &field_descriptor);
+                self.code_buffer.push(0xB5); // putfield
+                self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            }
         }
 
         for stmt in &ctor.body {
@@ -1191,15 +1236,31 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
             ACC_PUBLIC
         };
 
+        let mut has_getter = false;
+        let mut has_setter = false;
+
         for hook in &field.property_hooks {
             match hook.hook_type {
                 PropertyHookType::Get => {
+                    has_getter = true;
                     self.emit_getter(bytes, field, hook, access_flags)?;
                 }
                 PropertyHookType::Set => {
+                    has_setter = true;
                     self.emit_setter(bytes, field, hook, access_flags)?;
                 }
             }
+        }
+
+        // If only setter is defined, generate a default getter
+        if has_setter && !has_getter {
+            let default_getter_hook = PropertyHook {
+                hook_type: PropertyHookType::Get,
+                body: Vec::new(), // Empty body means auto-generated
+                param_type: None,
+                param_name: None,
+            };
+            self.emit_getter(bytes, field, &default_getter_hook, access_flags)?;
         }
 
         Ok(())
@@ -1224,9 +1285,13 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
         bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
 
+        // Set flag to indicate we're inside a property hook method
+        self.in_property_hook = true;
+        self.current_property_field = Some(field.name.clone());
+
         self.code_buffer.clear();
         self.local_vars.clear();
-        self.max_stack = 1; // getter needs at least 1 stack slot: object ref
+        self.max_stack = 4; // getter needs stack for string concat (StringBuilder + 2 strings)
         self.max_locals = 1;
         self.local_vars.insert("this".to_string(), (0, VarType::Ref));
 
@@ -1305,6 +1370,10 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
         bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
 
+        // Clear the flag after generating the property hook method
+        self.in_property_hook = false;
+        self.current_property_field = None;
+
         Ok(())
     }
 
@@ -1316,7 +1385,10 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         access_flags: u16,
     ) -> CompileResult<()> {
         let method_name = format!("set{}", capitalize(&field.name));
-        let descriptor = format!("({})V", field.field_type.to_jvm_descriptor());
+        
+        // Use hook's param_type if specified, otherwise use field's type
+        let setter_param_type = hook.param_type.as_ref().unwrap_or(&field.field_type);
+        let descriptor = format!("({})V", setter_param_type.to_jvm_descriptor());
 
         let name_idx = self.add_utf8_constant(&method_name);
         let desc_idx = self.add_utf8_constant(&descriptor);
@@ -1327,24 +1399,32 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
         bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
 
+        // Set flag to indicate we're inside a property hook method
+        self.in_property_hook = true;
+        self.current_property_field = Some(field.name.clone());
+
         self.code_buffer.clear();
         self.local_vars.clear();
-        self.max_stack = 2; // setter needs at least 2 stack slots: object ref + value
+        self.max_stack = 6; // setter needs stack for string concat (StringBuilder + multiple strings)
+        self.max_locals = 1;
         self.local_vars.insert("this".to_string(), (0, VarType::Ref));
         
-        // Add value parameter
-        let value_type = self.type_to_var_type(&field.field_type);
+        // Use hook's param_name if specified, otherwise use "value"
+        let param_name = hook.param_name.as_deref().unwrap_or("value");
+        
+        // Add value parameter with the correct type
+        let value_type = self.type_to_var_type(setter_param_type);
         let value_slots = match value_type {
             VarType::Long | VarType::Double => 2,
             _ => 1,
         };
-        self.local_vars.insert("value".to_string(), (1, value_type));
+        self.local_vars.insert(param_name.to_string(), (1, value_type));
         self.max_locals = 1 + value_slots;
 
         if hook.body.is_empty() {
             // Auto-generated setter: this.field = value;
             self.code_buffer.push(0x2A); // aload_0
-            self.emit_load_var("value")?;
+            self.emit_load_var(param_name)?;
             let field_descriptor = field.field_type.to_jvm_descriptor();
             let field_idx = self.add_fieldref_constant(&self.class_name.clone(), &field.name, &field_descriptor);
             self.code_buffer.push(0xB5); // putfield
@@ -1376,6 +1456,10 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
 
         bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
         bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
+        // Clear the flag after generating the property hook method
+        self.in_property_hook = false;
+        self.current_property_field = None;
 
         Ok(())
     }
@@ -2021,7 +2105,12 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                     if let Expr::FieldAccess(inner, field_name) = left_expr {
                         let field_name = field_name.clone();
                         // Check if this field has property hooks - if so, call setter instead
-                        if self.property_hook_fields.contains(&field_name) {
+                        // BUT: if we are inside the setter for this field, access the backing field directly
+                        // to avoid infinite recursion
+                        let is_same_field_in_setter = self.in_property_hook && 
+                            self.current_property_field.as_ref().map(|f| f == &field_name).unwrap_or(false);
+                        
+                        if self.property_hook_fields.contains(&field_name) && !is_same_field_in_setter {
                             let setter_name = format!("set{}", capitalize(&field_name));
                             let param_type = self.class_fields.get(&field_name)
                                 .map(|t| t.to_jvm_descriptor())
@@ -3101,7 +3190,12 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
 
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {
         // Check if this field has property hooks - if so, call getter instead
-        if self.property_hook_fields.contains(field_name) {
+        // BUT: if we are inside the getter/setter for this field, access the backing field directly
+        // to avoid infinite recursion
+        let is_same_field_in_hook = self.in_property_hook && 
+            self.current_property_field.as_ref().map(|f| f == field_name).unwrap_or(false);
+        
+        if self.property_hook_fields.contains(field_name) && !is_same_field_in_hook {
             let getter_name = format!("get{}", capitalize(field_name));
             let return_type = self.class_fields.get(field_name)
                 .map(|t| t.to_jvm_descriptor())

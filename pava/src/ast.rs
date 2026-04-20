@@ -320,6 +320,8 @@ pub struct CatchClause {
 pub struct PropertyHook {
     pub hook_type: PropertyHookType,
     pub body: Vec<Stmt>,
+    pub param_type: Option<Type>, // 用于setter的参数类型
+    pub param_name: Option<String>, // 用于setter的参数名
 }
 
 #[derive(Debug, Clone, PartialEq)]
