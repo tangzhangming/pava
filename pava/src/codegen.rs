@@ -881,10 +881,9 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         Ok(())
     }
 
-    fn build_stack_map_table(&self, initial_locals: u16) -> Vec<u8> {
+    fn build_stack_map_table(&self, _initial_locals: u16) -> Vec<u8> {
         let mut result = Vec::new();
         
-        // 收集所有需要stackmap frame的位置：异常处理器 + 分支目标
         let mut all_targets: Vec<u16> = self.exception_table.iter()
             .map(|e| e.handler_pc)
             .collect();
@@ -900,6 +899,8 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         let num_entries = all_targets.len() as u16;
         result.extend_from_slice(&num_entries.to_be_bytes());
 
+        let num_locals = self.max_locals;
+        
         let mut prev_offset = 0u16;
         for target_pc in all_targets {
             let offset_delta = if prev_offset == 0 {
@@ -912,9 +913,8 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
             result.push(255); // full_frame
             result.extend_from_slice(&offset_delta.to_be_bytes());
             
-            // 局部变量表
-            result.extend_from_slice(&initial_locals.to_be_bytes());
-            for idx in 0..initial_locals {
+            result.extend_from_slice(&num_locals.to_be_bytes());
+            for idx in 0..num_locals {
                 let var_type = self.get_local_var_type(idx);
                 match var_type {
                     VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => {
@@ -936,15 +936,12 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                 }
             }
             
-            // 操作数栈：检查这个位置是否是异常处理器
             let is_handler = self.exception_table.iter().any(|e| e.handler_pc == target_pc);
             if is_handler {
-                // 异常处理器入口： astore执行前，栈顶有一个Throwable（JVM压入的）
                 result.extend_from_slice(&1u16.to_be_bytes());
                 result.push(7); // OBJECT
                 result.extend_from_slice(&self.throwable_class_idx.to_be_bytes());
             } else {
-                // 普通分支目标（如catch后的代码）：栈为空
                 result.extend_from_slice(&0u16.to_be_bytes());
             }
         }
@@ -2578,6 +2575,32 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         left: &Expr,
         right: &Expr,
     ) -> CompileResult<()> {
+        // Check if comparing strings - if so, use equals() method like Kotlin
+        let left_type = self.infer_expr_type(left);
+        let right_type = self.infer_expr_type(right);
+        let is_string_comparison = left_type == VarType::String || right_type == VarType::String;
+        
+        if is_string_comparison && (*op == BinaryOp::Eq || *op == BinaryOp::Ne) {
+            self.emit_expr(left)?;
+            self.emit_expr(right)?;
+            
+            let objects_equals_idx = self.add_methodref_constant(
+                "java/util/Objects", 
+                "equals", 
+                "(Ljava/lang/Object;Ljava/lang/Object;)Z"
+            );
+            self.code_buffer.push(0xB8); // invokestatic
+            self.code_buffer.extend_from_slice(&objects_equals_idx.to_be_bytes());
+            self.update_max_stack(-1);
+            
+            if *op == BinaryOp::Ne {
+                self.code_buffer.push(0x04); // iconst_1
+                self.code_buffer.push(0x80); // ixor (flip the result: 1->0, 0->1)
+            }
+            
+            return Ok(());
+        }
+
         self.emit_expr(left)?;
         self.emit_expr(right)?;
 
@@ -2869,42 +2892,46 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         elseif_pairs: &[(Expr, Vec<Stmt>)],
         else_stmts: &Option<Vec<Stmt>>,
     ) -> CompileResult<()> {
-        let mut jmp_offsets = Vec::new();
+        let mut goto_patches = Vec::new();
 
         self.emit_expr(cond)?;
-        let jmp_offset = self.code_buffer.len();
+        self.code_buffer.push(0x99); // ifeq - jump if condition is false
+        let ifeq_offset_pos = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
 
         for stmt in then_stmts {
             self.emit_stmt(stmt)?;
         }
 
-        let skip_offset = self.code_buffer.len();
+        self.code_buffer.push(0xA7); // goto - skip else branch
+        let goto_offset_pos = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+        goto_patches.push(goto_offset_pos);
 
-        let current = self.code_buffer.len() as u16;
-        let then_end = (current - 4).to_be_bytes();
-        self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&then_end);
-
-        jmp_offsets.push(skip_offset);
+        let else_target = self.code_buffer.len() as u16;
+        self.branch_targets.push(else_target);
+        let ifeq_offset = else_target - (ifeq_offset_pos as u16 - 1);
+        self.code_buffer[ifeq_offset_pos..ifeq_offset_pos + 2].copy_from_slice(&ifeq_offset.to_be_bytes());
 
         for (ei_cond, ei_body) in elseif_pairs {
             self.emit_expr(ei_cond)?;
-            let ei_jmp = self.code_buffer.len();
+            self.code_buffer.push(0x99); // ifeq
+            let ei_ifeq_pos = self.code_buffer.len();
             self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
 
             for stmt in ei_body {
                 self.emit_stmt(stmt)?;
             }
 
-            let ei_skip = self.code_buffer.len();
+            self.code_buffer.push(0xA7); // goto
+            let ei_goto_pos = self.code_buffer.len();
             self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
+            goto_patches.push(ei_goto_pos);
 
-            let current = self.code_buffer.len() as u16;
-            let ei_then_end = (current - 4).to_be_bytes();
-            self.code_buffer[ei_jmp..ei_jmp + 2].copy_from_slice(&ei_then_end);
-
-            jmp_offsets.push(ei_skip);
+            let ei_target = self.code_buffer.len() as u16;
+            self.branch_targets.push(ei_target);
+            let ei_ifeq_offset = ei_target - (ei_ifeq_pos as u16 - 1);
+            self.code_buffer[ei_ifeq_pos..ei_ifeq_pos + 2].copy_from_slice(&ei_ifeq_offset.to_be_bytes());
         }
 
         if let Some(else_body) = else_stmts {
@@ -2913,10 +2940,11 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
             }
         }
 
-        let current = self.code_buffer.len() as u16;
-        for offset in jmp_offsets {
-            let end = (current - 2).to_be_bytes();
-            self.code_buffer[offset..offset + 2].copy_from_slice(&end);
+        let end_target = self.code_buffer.len() as u16;
+        self.branch_targets.push(end_target);
+        for patch_pos in goto_patches {
+            let goto_offset = end_target - (patch_pos as u16 - 1);
+            self.code_buffer[patch_pos..patch_pos + 2].copy_from_slice(&goto_offset.to_be_bytes());
         }
 
         Ok(())
@@ -2931,6 +2959,7 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         });
 
         self.emit_expr(cond)?;
+        self.code_buffer.push(0x99); // ifeq - jump if false (exit loop)
         let jmp_offset = self.code_buffer.len();
         self.code_buffer.extend_from_slice(&0u16.to_be_bytes());
 
@@ -2943,8 +2972,8 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         self.code_buffer.extend_from_slice(&offset.to_be_bytes());
 
         let loop_end = self.code_buffer.len();
-        let target = (loop_end as i16 - 2).to_be_bytes();
-        self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&target);
+        let target = (loop_end as i16 - jmp_offset as i16) + 3;
+        self.code_buffer[jmp_offset..jmp_offset + 2].copy_from_slice(&target.to_be_bytes());
 
         if let Some(ctx) = self.loop_stack.pop() {
             for patch_pos in ctx.break_patches {

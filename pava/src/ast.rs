@@ -254,7 +254,7 @@ pub struct ClosureExpr {
     pub body: Vec<Stmt>,             // 闭包体
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOp {
     Add,
     Sub,
