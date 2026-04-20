@@ -119,6 +119,7 @@ pub struct ClassField {
     pub is_internal: bool, // 模块内可见
     pub is_final: bool,
     pub initializer: Option<Expr>,
+    pub property_hooks: Vec<PropertyHook>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,4 +314,16 @@ pub struct CatchClause {
     pub exception_types: Vec<String>,
     pub var_name: String,
     pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertyHook {
+    pub hook_type: PropertyHookType,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyHookType {
+    Get,
+    Set,
 }

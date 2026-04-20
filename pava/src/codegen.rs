@@ -1,6 +1,8 @@
 use crate::ast::*;
 use crate::error::CompileResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+const ACC_SYNTHETIC: u16 = 0x1000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum VarType {
@@ -40,6 +42,8 @@ struct ExceptionEntry {
 pub struct CodeGen {
     loop_stack: Vec<LoopContext>,
     class_fields: HashMap<String, Type>,
+    class_methods: HashMap<String, Type>, // 方法名 -> 返回类型
+    property_hook_fields: HashSet<String>, // 记录哪些字段有 property hooks
     constant_pool: Vec<ConstantPoolEntry>,
     code_buffer: Vec<u8>,
     local_vars: HashMap<String, (u16, VarType)>,
@@ -112,6 +116,8 @@ impl CodeGen {
         CodeGen {
             loop_stack: Vec::new(),
             class_fields: HashMap::new(),
+            class_methods: HashMap::new(),
+            property_hook_fields: HashSet::new(),
             constant_pool: Vec::new(),
             code_buffer: Vec::new(),
             local_vars: HashMap::new(),
@@ -152,6 +158,34 @@ impl CodeGen {
         for field in &class.fields {
             self.class_fields
                 .insert(field.name.clone(), field.field_type.clone());
+            // 预添加所有字段名和类型到常量池，以便在生成方法时引用
+            self.add_utf8_constant(&field.name);
+            self.add_utf8_constant(&field.field_type.to_jvm_descriptor());
+        }
+
+        // 收集方法信息
+        for method in &class.methods {
+            self.class_methods
+                .insert(method.name.clone(), method.return_type.clone());
+        }
+        
+        // 收集属性挂钩生成的getter/setter方法信息
+        for field in &class.fields {
+            if !field.property_hooks.is_empty() {
+                self.property_hook_fields.insert(field.name.clone());
+                for hook in &field.property_hooks {
+                    match hook.hook_type {
+                        PropertyHookType::Get => {
+                            let method_name = format!("get{}", capitalize(&field.name));
+                            self.class_methods.insert(method_name, field.field_type.clone());
+                        }
+                        PropertyHookType::Set => {
+                            let method_name = format!("set{}", capitalize(&field.name));
+                            self.class_methods.insert(method_name, Type::Void);
+                        }
+                    }
+                }
+            }
         }
 
         if class.is_enum {
@@ -445,6 +479,13 @@ impl CodeGen {
             }
         }
 
+        // 为具有属性挂钩的字段生成getter/setter方法（在常量池输出之前）
+        for field in &class.fields {
+            if !field.property_hooks.is_empty() {
+                self.emit_property_methods(&mut method_bytes, field)?;
+            }
+        }
+
         // 现在常量池已经完整，计算并输出
         let cp_count = self.constant_pool.iter().fold(1, |acc, entry| {
             acc + match entry {
@@ -502,7 +543,13 @@ impl CodeGen {
         }
 
         for field in &class.fields {
-            self.emit_field(&mut bytes, field);
+            if field.property_hooks.is_empty() {
+                // 普通字段，生成 public 字段
+                self.emit_field(&mut bytes, field);
+            } else {
+                // 有 property hooks，生成私有 backing field
+                self.emit_property_backing_field(&mut bytes, field);
+            }
         }
 
         if let Some(ref ctor) = class.constructor {
@@ -511,7 +558,15 @@ impl CodeGen {
             }
         }
 
-        let method_count = class.methods.len() as u16 + 1 + if has_clinit { 1 } else { 0 };
+        // 计算属性挂钩方法数量
+        let property_methods_count: usize = class.fields.iter()
+            .map(|f| f.property_hooks.len())
+            .sum();
+        
+        let method_count = class.methods.len() as u16 
+            + 1  // <init>
+            + if has_clinit { 1 } else { 0 }
+            + property_methods_count as u16;
         bytes.extend_from_slice(&method_count.to_be_bytes());
 
         // 添加所有方法字节
@@ -534,6 +589,20 @@ impl CodeGen {
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
 
         // No attributes for now - value is set in <clinit>
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    fn emit_property_backing_field(&mut self, bytes: &mut Vec<u8>, field: &ClassField) {
+        let access_flags = ACC_PRIVATE;
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&field.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = field.field_type.to_jvm_descriptor();
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
         bytes.extend_from_slice(&0u16.to_be_bytes());
     }
 
@@ -993,6 +1062,7 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
 
         self.code_buffer.clear();
         self.local_vars.clear();
+        self.max_stack = 2;  // 构造函数至少需要2个栈槽（如println需要System.out和参数）
         self.max_locals = 1;
         self.local_vars
             .insert("this".to_string(), (0, VarType::Ref));
@@ -1106,6 +1176,210 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         Ok(())
     }
 
+    fn emit_property_methods(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        field: &ClassField,
+    ) -> CompileResult<()> {
+        let access_flags = if field.is_public || field.is_internal {
+            ACC_PUBLIC
+        } else if field.is_protected {
+            ACC_PROTECTED
+        } else if field.is_private {
+            ACC_PRIVATE
+        } else {
+            ACC_PUBLIC
+        };
+
+        for hook in &field.property_hooks {
+            match hook.hook_type {
+                PropertyHookType::Get => {
+                    self.emit_getter(bytes, field, hook, access_flags)?;
+                }
+                PropertyHookType::Set => {
+                    self.emit_setter(bytes, field, hook, access_flags)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn emit_getter(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        field: &ClassField,
+        hook: &PropertyHook,
+        access_flags: u16,
+    ) -> CompileResult<()> {
+        let method_name = format!("get{}", capitalize(&field.name));
+        let descriptor = format!("(){}", field.field_type.to_jvm_descriptor());
+
+        let name_idx = self.add_utf8_constant(&method_name);
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        let code_idx = self.add_utf8_constant("Code");
+
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+
+        self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_stack = 1; // getter needs at least 1 stack slot: object ref
+        self.max_locals = 1;
+        self.local_vars.insert("this".to_string(), (0, VarType::Ref));
+
+        if hook.body.is_empty() {
+            // Auto-generated getter: return this.field;
+            self.code_buffer.push(0x2A); // aload_0
+            let field_descriptor = field.field_type.to_jvm_descriptor();
+            let field_idx = self.add_fieldref_constant(&self.class_name.clone(), &field.name, &field_descriptor);
+            self.code_buffer.push(0xB4); // getfield
+            self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            
+            // Return based on type
+            match field.field_type {
+                Type::Int8 | Type::Int16 | Type::Int32 | Type::Boolean => {
+                    self.code_buffer.push(0xAC); // ireturn
+                }
+                Type::Int64 => {
+                    self.code_buffer.push(0xAD); // lreturn
+                }
+                Type::Float32 => {
+                    self.code_buffer.push(0xAE); // freturn
+                }
+                Type::Float64 => {
+                    self.code_buffer.push(0xAF); // dreturn
+                }
+                _ => {
+                    self.code_buffer.push(0xB0); // areturn
+                }
+            }
+        } else {
+            // Custom getter body
+            for stmt in &hook.body {
+                self.emit_stmt(stmt)?;
+            }
+            
+            // Ensure return
+            if self.code_buffer.is_empty() || self.code_buffer.last() != Some(&0xB1) {
+                if !hook.body.iter().any(|s| matches!(s, Stmt::Return(_))) {
+                    // Return default value based on type
+                    match field.field_type {
+                        Type::Int8 | Type::Int16 | Type::Int32 | Type::Boolean => {
+                            self.code_buffer.push(0x03); // iconst_0
+                            self.code_buffer.push(0xAC); // ireturn
+                        }
+                        Type::Int64 => {
+                            self.code_buffer.push(0x09); // lconst_0
+                            self.code_buffer.push(0xAD); // lreturn
+                        }
+                        Type::Float32 => {
+                            self.code_buffer.push(0x0B); // fconst_0
+                            self.code_buffer.push(0xAE); // freturn
+                        }
+                        Type::Float64 => {
+                            self.code_buffer.push(0x0E); // dconst_0
+                            self.code_buffer.push(0xAF); // dreturn
+                        }
+                        _ => {
+                            self.code_buffer.push(0x01); // aconst_null
+                            self.code_buffer.push(0xB0); // areturn
+                        }
+                    }
+                }
+            }
+        }
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_idx.to_be_bytes());
+        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
+        bytes.extend_from_slice(&self.max_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
+
+        let code_len = self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+        bytes.extend_from_slice(&self.code_buffer);
+
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
+        Ok(())
+    }
+
+    fn emit_setter(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        field: &ClassField,
+        hook: &PropertyHook,
+        access_flags: u16,
+    ) -> CompileResult<()> {
+        let method_name = format!("set{}", capitalize(&field.name));
+        let descriptor = format!("({})V", field.field_type.to_jvm_descriptor());
+
+        let name_idx = self.add_utf8_constant(&method_name);
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        let code_idx = self.add_utf8_constant("Code");
+
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+
+        self.code_buffer.clear();
+        self.local_vars.clear();
+        self.max_stack = 2; // setter needs at least 2 stack slots: object ref + value
+        self.local_vars.insert("this".to_string(), (0, VarType::Ref));
+        
+        // Add value parameter
+        let value_type = self.type_to_var_type(&field.field_type);
+        let value_slots = match value_type {
+            VarType::Long | VarType::Double => 2,
+            _ => 1,
+        };
+        self.local_vars.insert("value".to_string(), (1, value_type));
+        self.max_locals = 1 + value_slots;
+
+        if hook.body.is_empty() {
+            // Auto-generated setter: this.field = value;
+            self.code_buffer.push(0x2A); // aload_0
+            self.emit_load_var("value")?;
+            let field_descriptor = field.field_type.to_jvm_descriptor();
+            let field_idx = self.add_fieldref_constant(&self.class_name.clone(), &field.name, &field_descriptor);
+            self.code_buffer.push(0xB5); // putfield
+            self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+            self.code_buffer.push(0xB1); // return
+        } else {
+            // Custom setter body
+            for stmt in &hook.body {
+                self.emit_stmt(stmt)?;
+            }
+            
+            // Ensure return
+            if self.code_buffer.is_empty() || self.code_buffer.last() != Some(&0xB1) {
+                if !hook.body.iter().any(|s| matches!(s, Stmt::Return(_))) {
+                    self.code_buffer.push(0xB1); // return
+                }
+            }
+        }
+
+        let code_attr_len = 12 + self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_idx.to_be_bytes());
+        bytes.extend_from_slice(&code_attr_len.to_be_bytes());
+        bytes.extend_from_slice(&self.max_stack.to_be_bytes());
+        bytes.extend_from_slice(&self.max_locals.to_be_bytes());
+
+        let code_len = self.code_buffer.len() as u32;
+        bytes.extend_from_slice(&code_len.to_be_bytes());
+        bytes.extend_from_slice(&self.code_buffer);
+
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
+        Ok(())
+    }
+
     fn emit_main_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
         let main_idx = self.add_utf8_constant("main");
         let main_desc_idx = self.add_utf8_constant("([Ljava/lang/String;)V");
@@ -1206,8 +1480,27 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
             Stmt::Return(e) => {
                 if let Some(expr) = e {
                     self.emit_expr(expr)?;
+                    let return_type = self.infer_expr_type(expr);
+                    match return_type {
+                        VarType::Byte | VarType::Short | VarType::Int | VarType::Bool => {
+                            self.code_buffer.push(0xAC); // ireturn
+                        }
+                        VarType::Long => {
+                            self.code_buffer.push(0xAD); // lreturn
+                        }
+                        VarType::Float => {
+                            self.code_buffer.push(0xAE); // freturn
+                        }
+                        VarType::Double => {
+                            self.code_buffer.push(0xAF); // dreturn
+                        }
+                        _ => {
+                            self.code_buffer.push(0xB0); // areturn
+                        }
+                    }
+                } else {
+                    self.code_buffer.push(0xB1); // void return
                 }
-                self.code_buffer.push(0xB1);
             }
             Stmt::If(cond, then_stmts, elseif_pairs, else_stmts) => {
                 self.emit_if_with_elseif(cond, then_stmts, elseif_pairs, else_stmts)?
@@ -1723,8 +2016,56 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                     self.emit_expr(right)?;
                     self.emit_store_var(&name, var_type)?;
                 } else {
-                    self.emit_expr(right)?;
-                    self.emit_store_field(left)?;
+                    // 对于字段赋值，需要先压入对象引用，再压入值
+                    // 然后调用putfield
+                    if let Expr::FieldAccess(inner, field_name) = left_expr {
+                        let field_name = field_name.clone();
+                        // Check if this field has property hooks - if so, call setter instead
+                        if self.property_hook_fields.contains(&field_name) {
+                            let setter_name = format!("set{}", capitalize(&field_name));
+                            let param_type = self.class_fields.get(&field_name)
+                                .map(|t| t.to_jvm_descriptor())
+                                .unwrap_or_else(|| "I".to_string());
+                            let method_desc = format!("({})V", param_type);
+                            let class_name = self.class_name.clone();
+                            let method_idx = self.add_methodref_constant(&class_name, &setter_name, &method_desc);
+                            self.emit_expr(inner)?;
+                            self.emit_expr(right)?;
+                            self.code_buffer.push(0xB6); // invokevirtual
+                            self.code_buffer.extend_from_slice(&method_idx.to_be_bytes());
+                        } else {
+                            // 先压入对象引用
+                            self.emit_expr(inner)?;
+                            // 再压入值
+                            self.emit_expr(right)?;
+                            // 调用putfield
+                            let class_name = self.infer_class_name_from_expr(inner);
+                            let field_type = self
+                                .class_fields
+                                .get(&field_name)
+                                .map(|t| t.to_jvm_descriptor())
+                                .unwrap_or_else(|| "I".to_string());
+                            let field_idx = self.add_fieldref_constant(&class_name, &field_name, &field_type);
+                            self.code_buffer.push(0xB5);
+                            self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                        }
+                    } else if let Expr::StaticFieldAccess(class_name, field_name) = left_expr {
+                        // 静态字段赋值
+                        self.emit_expr(right)?;
+                        let resolved_class = self.resolve_static_class(class_name);
+                        let field_type = self
+                            .class_fields
+                            .get(field_name)
+                            .map(|t| t.to_jvm_descriptor())
+                            .unwrap_or_else(|| "I".to_string());
+                        let field_idx = self.add_fieldref_constant(&resolved_class, field_name, &field_type);
+                        self.code_buffer.push(0xB3);
+                        self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
+                    } else {
+                        // 其他情况，回退到原来的逻辑
+                        self.emit_expr(right)?;
+                        self.emit_store_field(left)?;
+                    }
                 }
             }
             BinaryOp::AddAssign
@@ -1792,6 +2133,12 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         match obj {
             Expr::FieldAccess(inner, field_name) => {
                 self.emit_expr(inner)?;
+                // swap: 将objectref放到栈顶，value放到下面
+                // 当前栈: [value, objectref]
+                // 需要: [objectref, value]
+                // 但swap只能交换栈顶两个相同大小的元素
+                // 对于不同大小的元素，需要特殊处理
+                // 简单方案: 重新组织代码生成顺序
                 let class_name = self.infer_class_name_from_expr(inner);
                 let field_type = self
                     .class_fields
@@ -2753,6 +3100,21 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
     }
 
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> CompileResult<()> {
+        // Check if this field has property hooks - if so, call getter instead
+        if self.property_hook_fields.contains(field_name) {
+            let getter_name = format!("get{}", capitalize(field_name));
+            let return_type = self.class_fields.get(field_name)
+                .map(|t| t.to_jvm_descriptor())
+                .unwrap_or_else(|| "I".to_string());
+            let method_desc = format!("(){}", return_type);
+            let class_name = self.class_name.clone();
+            let method_idx = self.add_methodref_constant(&class_name, &getter_name, &method_desc);
+            self.emit_expr(obj)?;
+            self.code_buffer.push(0xB6); // invokevirtual
+            self.code_buffer.extend_from_slice(&method_idx.to_be_bytes());
+            return Ok(());
+        }
+
         self.emit_expr(obj)?;
         let class_name = self.infer_class_name_from_expr(obj);
         let field_type = self
@@ -2892,8 +3254,34 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                 .get(name)
                 .map(|(_, ty)| *ty)
                 .unwrap_or(VarType::Int),
+            Expr::MethodCall(_, method_name, _) => {
+                // 根据方法返回类型推断
+                if let Some(return_type) = self.class_methods.get(method_name) {
+                    self.type_to_var_type(return_type)
+                } else {
+                    VarType::Ref
+                }
+            }
             Expr::NewObject(_, _) => VarType::Ref,
-            Expr::FieldAccess(_, _) | Expr::StaticFieldAccess(_, _) => VarType::Ref,
+            Expr::FieldAccess(_, field_name) | Expr::StaticFieldAccess(_, field_name) => {
+                // Check if this field has property hooks - if so, return getter's return type
+                if self.property_hook_fields.contains(field_name) {
+                    let getter_name = format!("get{}", capitalize(field_name));
+                    if let Some(return_type) = self.class_methods.get(&getter_name) {
+                        match return_type {
+                            Type::Int8 | Type::Int16 | Type::Int32 | Type::Boolean => VarType::Int,
+                            Type::Int64 => VarType::Long,
+                            Type::Float32 => VarType::Float,
+                            Type::Float64 => VarType::Double,
+                            _ => VarType::String,
+                        }
+                    } else {
+                        VarType::Ref
+                    }
+                } else {
+                    VarType::Ref
+                }
+            }
             Expr::Ternary(_, then_expr, else_expr) => {
                 let then_ty = self.infer_expr_type(then_expr);
                 let else_ty = self.infer_expr_type(else_expr);
@@ -3033,6 +3421,16 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         let name_idx = self.add_utf8_constant(method_name);
         let desc_idx = self.add_utf8_constant(descriptor);
         let name_and_type_idx = self.add_name_and_type_constant(name_idx, desc_idx);
+        
+        // 检查是否已存在相同的MethodRef条目
+        for (i, entry) in self.constant_pool.iter().enumerate() {
+            if let ConstantPoolEntry::MethodRef(c, nat) = entry {
+                if *c == class_idx && *nat == name_and_type_idx {
+                    return (i + 1) as u16;
+                }
+            }
+        }
+        
         let idx = self.constant_pool.len() as u16 + 1;
         self.constant_pool
             .push(ConstantPoolEntry::MethodRef(class_idx, name_and_type_idx));
@@ -3145,4 +3543,12 @@ pub fn compile_unit(unit: &CompilationUnit) -> CompileResult<Vec<(String, Vec<u8
     }
 
     Ok(results)
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
 }

@@ -47,6 +47,8 @@ pub enum Token {
     Catch,
     Throw,
     Finally,
+    Get,
+    Set,
 
     // Types
     Type(String),
@@ -305,11 +307,14 @@ impl Lexer {
                 }
             }
             '=' => {
-                // Check for == (Eq)
+                // Check for == (Eq) or => (Arrow for PHP 8.4 property hooks)
                 let next_ch = self.peek_char();
                 if next_ch == '=' {
                     self.read_char();
                     Token::Eq
+                } else if next_ch == '>' {
+                    self.read_char();
+                    Token::Arrow
                 } else {
                     Token::Equal
                 }
@@ -465,6 +470,8 @@ impl Lexer {
             "catch" => Token::Catch,
             "throw" => Token::Throw,
             "finally" => Token::Finally,
+            "get" => Token::Get,
+            "set" => Token::Set,
             "instanceof" => Token::Instanceof,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,

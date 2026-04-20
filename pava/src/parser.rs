@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOp, CaptureVar, CatchClause, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
-    EnumValue, Expr, Import, PromotedParam, Stmt, Type, UnaryOp,
+    EnumValue, Expr, Import, PromotedParam, PropertyHook, PropertyHookType, Stmt, Type, UnaryOp,
 };
 use crate::error::{CompileError, CompileResult};
 use crate::lexer::{Lexer, Token};
@@ -343,10 +343,20 @@ impl Parser {
                     self.bump();
                     if self.current_token == Token::Function {
                         self.bump();
+                        // 检查是否是构造函数 __construct
+                        let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                            n == "__construct"
+                        } else {
+                            false
+                        };
                         let m = self.parse_method_with_flags(
-                            true, true, false, false, false, false, false, false,
+                            true, true, false, false, false, false, false, is_constructor,
                         )?;
-                        methods.push(m);
+                        if is_constructor {
+                            constructor = Some(m);
+                        } else {
+                            methods.push(m);
+                        }
                     } else {
                         let mut f = self.parse_field(true, false, false, false)?;
                         f.is_static = true;
@@ -355,6 +365,12 @@ impl Parser {
                 }
                 Token::Function => {
                     self.bump();
+                    // 检查是否是构造函数 __construct
+                    let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                        n == "__construct"
+                    } else {
+                        false
+                    };
                     let is_abstract_method = is_abstract && !is_interface;
                     let is_default_method = is_interface;
                     let m = self.parse_method_with_flags(
@@ -365,9 +381,13 @@ impl Parser {
                         false,
                         is_abstract_method,
                         is_default_method,
-                        false,
+                        is_constructor,
                     )?;
-                    methods.push(m);
+                    if is_constructor {
+                        constructor = Some(m);
+                    } else {
+                        methods.push(m);
+                    }
                 }
                 Token::Public | Token::Private | Token::Protected | Token::Internal => {
                     let (is_public, is_private, is_protected, is_internal) =
@@ -377,6 +397,12 @@ impl Parser {
                             self.bump();
                             if self.current_token == Token::Function {
                                 self.bump();
+                                // 检查是否是构造函数 __construct
+                                let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                                    n == "__construct"
+                                } else {
+                                    false
+                                };
                                 let m = self.parse_method_with_flags(
                                     true,
                                     is_public,
@@ -385,9 +411,13 @@ impl Parser {
                                     is_internal,
                                     false,
                                     false,
-                                    false,
+                                    is_constructor,
                                 )?;
-                                methods.push(m);
+                                if is_constructor {
+                                    constructor = Some(m);
+                                } else {
+                                    methods.push(m);
+                                }
                             } else {
                                 let mut f = self.parse_field(
                                     is_public,
@@ -401,6 +431,12 @@ impl Parser {
                         }
                         Token::Function => {
                             self.bump();
+                            // 检查是否是构造函数 __construct
+                            let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                                n == "__construct"
+                            } else {
+                                false
+                            };
                             let m = self.parse_method_with_flags(
                                 false,
                                 is_public,
@@ -409,9 +445,13 @@ impl Parser {
                                 is_internal,
                                 false,
                                 false,
-                                false,
+                                is_constructor,
                             )?;
-                            methods.push(m);
+                            if is_constructor {
+                                constructor = Some(m);
+                            } else {
+                                methods.push(m);
+                            }
                         }
                         Token::Abstract => {
                             self.bump();
@@ -555,6 +595,35 @@ impl Parser {
         };
         self.bump();
 
+        // Check for property hooks: { get; set; } or { get { ... } set { ... } }
+        let mut property_hooks = Vec::new();
+        if self.current_token == Token::LBrace {
+            self.bump(); // consume '{'
+            
+            while self.current_token != Token::RBrace {
+                match &self.current_token {
+                    Token::Get => {
+                        self.bump(); // consume 'get'
+                        let hook = self.parse_property_hook(PropertyHookType::Get)?;
+                        property_hooks.push(hook);
+                    }
+                    Token::Set => {
+                        self.bump(); // consume 'set'
+                        let hook = self.parse_property_hook(PropertyHookType::Set)?;
+                        property_hooks.push(hook);
+                    }
+                    _ => {
+                        return Err(CompileError::ParserError(format!(
+                            "Expected 'get' or 'set' in property hooks, got {:?}",
+                            self.current_token
+                        )));
+                    }
+                }
+            }
+            
+            self.expect(Token::RBrace)?; // consume '}'
+        }
+
         let initializer = if self.current_token == Token::Equal {
             self.bump();
             Some(self.parse_expr()?)
@@ -577,6 +646,39 @@ impl Parser {
             is_internal,
             is_final: false,
             initializer,
+            property_hooks,
+        })
+    }
+
+    fn parse_property_hook(&mut self, hook_type: PropertyHookType) -> CompileResult<PropertyHook> {
+        // Check if it's a short form: get; or set;
+        if self.current_token == Token::Semicolon {
+            self.bump(); // consume ';'
+            return Ok(PropertyHook {
+                hook_type,
+                body: Vec::new(), // Empty body means auto-generated
+            });
+        }
+        
+        // Check for arrow expression: get => expr;
+        if self.current_token == Token::Arrow {
+            self.bump(); // consume '=>'
+            let expr = self.parse_expr()?;
+            self.expect(Token::Semicolon)?;
+            return Ok(PropertyHook {
+                hook_type,
+                body: vec![Stmt::Return(Some(expr))],
+            });
+        }
+        
+        // Full block form: get { ... }
+        self.expect(Token::LBrace)?;
+        let body = self.parse_block()?;
+        self.expect(Token::RBrace)?;
+        
+        Ok(PropertyHook {
+            hook_type,
+            body,
         })
     }
 
@@ -847,7 +949,7 @@ impl Parser {
             // 处理类型关键字 Token
             Token::TypeInt => {
                 self.bump();
-                Ok(Type::Int64)
+                Ok(Type::Int32)
             }
             Token::TypeInt8 => {
                 self.bump();
