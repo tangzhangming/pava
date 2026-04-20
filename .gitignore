@@ -1,0 +1,6 @@
+/example
+/target
+/plan
+*.class
+*.pava
+*.php
