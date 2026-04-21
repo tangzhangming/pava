@@ -1344,6 +1344,14 @@ Ok(AnnotationDefinition {
         loop {
             let target = match &self.current_token {
                 Token::Identifier(n) => match n.as_str() {
+                    // Java ElementType style (简洁风格)
+                    "TYPE" => AnnotationTarget::Class,
+                    "FIELD" => AnnotationTarget::Field,
+                    "METHOD" => AnnotationTarget::Method,
+                    "PARAMETER" => AnnotationTarget::Parameter,
+                    "CONSTRUCTOR" => AnnotationTarget::Constructor,
+                    "PROPERTY" => AnnotationTarget::Property,
+                    // Legacy PHP Attribute style (兼容旧风格)
                     "TARGET_CLASS" => AnnotationTarget::Class,
                     "TARGET_FIELD" => AnnotationTarget::Field,
                     "TARGET_METHOD" => AnnotationTarget::Method,
@@ -1359,7 +1367,7 @@ Ok(AnnotationDefinition {
                     }
                     _ => {
                         return Err(CompileError::ParserError(format!(
-                            "Unknown target flag: {}",
+                            "Unknown target flag: {}. Use TYPE, FIELD, METHOD, PARAMETER, CONSTRUCTOR, or PROPERTY",
                             n
                         )))
                     }
@@ -1384,6 +1392,11 @@ Ok(AnnotationDefinition {
     fn parse_retention_flag(&mut self) -> CompileResult<AnnotationRetention> {
         let retention = match &self.current_token {
             Token::Identifier(n) => match n.as_str() {
+                // Java RetentionPolicy style (简洁风格)
+                "SOURCE" => AnnotationRetention::Source,
+                "CLASS" => AnnotationRetention::Class,
+                "RUNTIME" => AnnotationRetention::Runtime,
+                // Legacy PHP Attribute style (兼容旧风格)
                 "RETENTION_SOURCE" => AnnotationRetention::Source,
                 "RETENTION_CLASS" => AnnotationRetention::Class,
                 "RETENTION_RUNTIME" => AnnotationRetention::Runtime,
@@ -1396,14 +1409,14 @@ Ok(AnnotationDefinition {
                 }
                 _ => {
                     return Err(CompileError::ParserError(format!(
-                        "Unknown retention flag: {}",
+                        "Unknown retention flag: {}. Use SOURCE, CLASS, or RUNTIME",
                         n
                     )))
                 }
             },
             _ => {
                 return Err(CompileError::ParserError(
-                    "Expected retention flag".to_string(),
+                    "Expected retention flag (SOURCE, CLASS, or RUNTIME)".to_string(),
                 ))
             }
         };
@@ -1442,12 +1455,12 @@ Ok(AnnotationDefinition {
         };
 
         let default_value = if self.current_token == Token::Equal {
-            return Err(CompileError::ParserError(
-                "Pava annotation property defaults must use ':' instead of '='. Use: `$name: defaultValue`".to_string()
-            ));
-        } else if self.current_token == Token::Colon {
             self.bump();
             Some(self.parse_annotation_value()?)
+        } else if self.current_token == Token::Colon {
+            return Err(CompileError::ParserError(
+                "Pava annotation property defaults must use '=' instead of ':'. Use: `public string $name = \"default\";`".to_string()
+            ));
         } else {
             None
         };
@@ -1616,7 +1629,7 @@ Ok(AnnotationDefinition {
         while self.current_token != Token::RParen {
             if matches!(self.current_token, Token::Equal | Token::LBrace) {
                 return Err(CompileError::ParserError(
-                    "Pava annotation arguments must use ':' for key-value pairs and '[]' for arrays, not '=' and '{}'. Example: @Column(\"id\", nullable: false) or @Names([\"a\", \"b\"])".to_string()
+                    "Pava annotation usage must use ':' for key-value pairs and '[]' for arrays. Example: @Column(name: \"id\", nullable: false) or @Names([\"a\", \"b\"])".to_string()
                 ));
             }
 
@@ -1645,7 +1658,7 @@ Ok(AnnotationDefinition {
                 return Ok((Some(potential_key), value));
             } else if self.current_token == Token::Equal {
                 return Err(CompileError::ParserError(
-                    "Pava annotation arguments must use ':' instead of '='. Example: @Column(name: \"id\")".to_string()
+                    "Pava annotation usage must use ':' instead of '=' for arguments. Example: @Column(name: \"id\")".to_string()
                 ));
             } else {
                 return Ok((None, AnnotationValue::String(potential_key)));
