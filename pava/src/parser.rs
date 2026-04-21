@@ -1,9 +1,12 @@
 use crate::ast::{
-    BinaryOp, CaptureVar, CatchClause, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
+    AnnotationArgument, AnnotationDefinition, AnnotationProperty, AnnotationRetention,
+    AnnotationTarget, AnnotationUsage, AnnotationValue, AttributeMeta, BinaryOp, CaptureVar,
+    CatchClause, Class, ClassConst, ClassField, ClassMethod, ClosureExpr, CompilationUnit,
     EnumValue, Expr, Import, PromotedParam, PropertyHook, PropertyHookType, Stmt, Type, UnaryOp,
 };
 use crate::error::{CompileError, CompileResult};
 use crate::lexer::{Lexer, Token};
+use std::collections::HashSet;
 
 pub struct Parser {
     lexer: Lexer,
@@ -169,23 +172,32 @@ impl Parser {
         Ok(())
     }
 
-    /// 解析编译单元（包含 package、imports 和 classes）
     pub fn parse_compilation_unit(&mut self) -> CompileResult<CompilationUnit> {
-        // 解析可选的 package 声明
         if self.current_token == Token::Package {
             self.parse_package()?;
         }
 
-        // 解析可选的 import 声明列表
         while self.current_token == Token::Import {
             self.parse_import()?;
         }
 
-        // 解析类定义
         let mut classes = Vec::new();
+        let mut annotations = Vec::new();
         while self.current_token != Token::Eof {
-            // 跳过可能的空白 token
-            if matches!(
+            if self.current_token == Token::Annotation {
+                let annotation = self.parse_annotation()?;
+                annotations.push(annotation.with_package(&self.package));
+            } else if self.current_token == Token::Public {
+                self.bump();
+                if self.current_token == Token::Annotation {
+                    self.bump();
+                    let annotation = self.parse_annotation_public()?;
+                    annotations.push(annotation.with_package(&self.package));
+                } else {
+                    let class = self.parse_class_after_visibility(true, false, false, false)?;
+                    classes.push(class.with_package(&self.package));
+                }
+            } else if matches!(
                 self.current_token,
                 Token::Class
                     | Token::Interface
@@ -193,11 +205,11 @@ impl Parser {
                     | Token::Abstract
                     | Token::Final
                     | Token::Open
+                    | Token::At
             ) {
                 let class = self.parse_class()?;
                 classes.push(class.with_package(&self.package));
             } else {
-                // 跳过无法识别的 token
                 self.bump();
             }
         }
@@ -206,10 +218,16 @@ impl Parser {
             package: self.package.clone(),
             imports: self.imports.clone(),
             classes,
+            annotations,
         })
     }
 
     pub fn parse_class(&mut self) -> CompileResult<Class> {
+        let mut annotations = Vec::new();
+        while self.current_token == Token::At {
+            annotations.push(self.parse_annotation_usage()?);
+        }
+
         let mut is_abstract = false;
         let mut is_final = false;
         let mut is_interface = false;
@@ -526,7 +544,7 @@ impl Parser {
 
         Ok(Class {
             name: self.class_name.clone(),
-            full_name: self.class_name.clone(), // 默认值，后面会被 with_package 覆盖
+            full_name: self.class_name.clone(),
             extends,
             implements,
             is_abstract,
@@ -540,6 +558,315 @@ impl Parser {
             constants,
             constructor,
             enum_values,
+            annotations,
+        })
+    }
+
+    fn parse_class_after_visibility(
+        &mut self,
+        is_public: bool,
+        is_private: bool,
+        is_protected: bool,
+        is_internal: bool,
+    ) -> CompileResult<Class> {
+        let mut annotations = Vec::new();
+        while self.current_token == Token::At {
+            annotations.push(self.parse_annotation_usage()?);
+        }
+
+        let mut is_abstract = false;
+        let mut is_final = false;
+        let mut is_interface = false;
+        let mut is_enum = false;
+        let mut is_open = false;
+        let mut enum_backed_type = None;
+
+        match &self.current_token {
+            Token::Open => {
+                is_open = true;
+                self.bump();
+                self.expect(Token::Class)?;
+            }
+            Token::Abstract => {
+                is_abstract = true;
+                self.bump();
+                self.expect(Token::Class)?;
+            }
+            Token::Interface => {
+                is_interface = true;
+                self.bump();
+            }
+            Token::Enum => {
+                is_enum = true;
+                self.bump();
+            }
+            Token::Final => {
+                is_final = true;
+                self.bump();
+                self.expect(Token::Class)?;
+            }
+            Token::Class => {
+                self.bump();
+            }
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected class, interface, or enum".to_string(),
+                ))
+            }
+        }
+
+        let name = match &self.current_token {
+            Token::Identifier(n) => n.clone(),
+            _ => return Err(CompileError::ParserError("Expected class name".to_string())),
+        };
+        self.class_name = name.clone();
+        self.bump();
+
+        if is_enum && self.current_token == Token::Colon {
+            self.bump();
+            enum_backed_type = Some(self.parse_type()?);
+        }
+
+        let mut extends = None;
+        let mut implements = Vec::new();
+
+        if self.current_token == Token::Extends {
+            self.bump();
+            extends = match &self.current_token {
+                Token::Identifier(n) => Some(n.clone()),
+                _ => {
+                    return Err(CompileError::ParserError(
+                        "Expected parent class name".to_string(),
+                    ))
+                }
+            };
+            self.bump();
+        }
+
+        if self.current_token == Token::Implements {
+            self.bump();
+            loop {
+                implements.push(match &self.current_token {
+                    Token::Identifier(n) => n.clone(),
+                    _ => {
+                        return Err(CompileError::ParserError(
+                            "Expected interface name".to_string(),
+                        ))
+                    }
+                });
+                self.bump();
+                if self.current_token == Token::Comma {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.expect(Token::LBrace)?;
+
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        let mut constants = Vec::new();
+        let mut constructor = None;
+        let mut enum_values = Vec::new();
+
+        while self.current_token != Token::RBrace {
+            match &self.current_token {
+                Token::Const => {
+                    let c = self.parse_const()?;
+                    constants.push(c);
+                }
+                Token::Case if is_enum => {
+                    self.bump();
+                    let enum_name = match &self.current_token {
+                        Token::Identifier(n) => n.clone(),
+                        _ => {
+                            return Err(CompileError::ParserError(
+                                "Expected enum case name".to_string(),
+                            ))
+                        }
+                    };
+                    self.bump();
+                    let value = if self.current_token == Token::Equal {
+                        self.bump();
+                        match &self.current_token {
+                            Token::IntLiteral(n) => *n,
+                            _ => 0,
+                        }
+                    } else {
+                        enum_values.len() as i64
+                    };
+                    enum_values.push(EnumValue {
+                        name: enum_name,
+                        value,
+                    });
+                    self.expect(Token::Semicolon)?;
+                }
+                Token::Static => {
+                    self.bump();
+                    if self.current_token == Token::Function {
+                        self.bump();
+                        let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                            n == "__construct"
+                        } else {
+                            false
+                        };
+                        let m = self.parse_method_with_flags(
+                            true, is_public, is_private, is_protected, is_internal, false, false, is_constructor,
+                        )?;
+                        if is_constructor {
+                            constructor = Some(m);
+                        } else {
+                            methods.push(m);
+                        }
+                    } else {
+                        let mut f = self.parse_field(is_public, is_private, is_protected, is_internal)?;
+                        f.is_static = true;
+                        fields.push(f);
+                    }
+                }
+                Token::Function => {
+                    self.bump();
+                    let is_constructor = if let Token::Identifier(n) = &self.current_token {
+                        n == "__construct"
+                    } else {
+                        false
+                    };
+                    let is_abstract_method = is_abstract && !is_interface;
+                    let is_default_method = is_interface;
+                    let m = self.parse_method_with_flags(
+                        false, is_public, is_private, is_protected, is_internal, is_abstract_method, is_default_method, is_constructor,
+                    )?;
+                    if is_constructor {
+                        constructor = Some(m);
+                    } else {
+                        methods.push(m);
+                    }
+                }
+                Token::Public | Token::Private | Token::Protected | Token::Internal => {
+                    let (vis_pub, vis_priv, vis_prot, vis_int) = self.parse_visibility();
+                    match &self.current_token {
+                        Token::Static => {
+                            self.bump();
+                            if self.current_token == Token::Function {
+                                self.bump();
+                                let is_ctor = if let Token::Identifier(n) = &self.current_token {
+                                    n == "__construct"
+                                } else {
+                                    false
+                                };
+                                let m = self.parse_method_with_flags(
+                                    true, vis_pub, vis_priv, vis_prot, vis_int, false, false, is_ctor,
+                                )?;
+                                if is_ctor {
+                                    constructor = Some(m);
+                                } else {
+                                    methods.push(m);
+                                }
+                            } else {
+                                let mut f = self.parse_field(vis_pub, vis_priv, vis_prot, vis_int)?;
+                                f.is_static = true;
+                                fields.push(f);
+                            }
+                        }
+                        Token::Function => {
+                            self.bump();
+                            let is_ctor = if let Token::Identifier(n) = &self.current_token {
+                                n == "__construct"
+                            } else {
+                                false
+                            };
+                            let m = self.parse_method_with_flags(
+                                false, vis_pub, vis_priv, vis_prot, vis_int, false, false, is_ctor,
+                            )?;
+                            if is_ctor {
+                                constructor = Some(m);
+                            } else {
+                                methods.push(m);
+                            }
+                        }
+                        Token::Abstract => {
+                            self.bump();
+                            self.expect(Token::Function)?;
+                            let m = self.parse_abstract_method(vis_pub, vis_priv, vis_prot, vis_int)?;
+                            methods.push(m);
+                        }
+                        Token::Final => {
+                            self.bump();
+                            let mut f = self.parse_field(vis_pub, vis_priv, vis_prot, vis_int)?;
+                            f.is_final = true;
+                            fields.push(f);
+                        }
+                        _ => {
+                            let f = self.parse_field(vis_pub, vis_priv, vis_prot, vis_int)?;
+                            fields.push(f);
+                        }
+                    }
+                }
+                Token::Abstract => {
+                    self.bump();
+                    self.expect(Token::Function)?;
+                    let m = self.parse_abstract_method(true, false, false, false)?;
+                    methods.push(m);
+                }
+                Token::Identifier(n) => {
+                    if n == "__construct" {
+                        self.bump();
+                        let m = self.parse_method_with_flags(
+                            false, is_public, is_private, is_protected, is_internal, false, false, true,
+                        )?;
+                        constructor = Some(m);
+                    } else {
+                        let f = self.parse_field(is_public, is_private, is_protected, is_internal)?;
+                        fields.push(f);
+                    }
+                }
+                Token::Final => {
+                    self.bump();
+                    let mut f = self.parse_field(is_public, is_private, is_protected, is_internal)?;
+                    f.is_final = true;
+                    fields.push(f);
+                }
+                Token::Type(_)
+                | Token::TypeInt8
+                | Token::TypeInt16
+                | Token::TypeInt32
+                | Token::TypeInt64
+                | Token::TypeFloat32
+                | Token::TypeFloat64
+                | Token::TypeBoolean
+                | Token::TypeByte
+                | Token::TypeInt
+                | Token::TypeFloat => {
+                    let f = self.parse_field(is_public, is_private, is_protected, is_internal)?;
+                    fields.push(f);
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+
+        self.expect(Token::RBrace)?;
+
+        Ok(Class {
+            name: self.class_name.clone(),
+            full_name: self.class_name.clone(),
+            extends,
+            implements,
+            is_abstract,
+            is_final,
+            is_open,
+            is_interface,
+            is_enum,
+            enum_backed_type,
+            fields,
+            methods,
+            constants,
+            constructor,
+            enum_values,
+            annotations,
         })
     }
 
@@ -581,6 +908,11 @@ impl Parser {
         is_protected: bool,
         is_internal: bool,
     ) -> CompileResult<ClassField> {
+        let mut annotations = Vec::new();
+        while self.current_token == Token::At {
+            annotations.push(self.parse_annotation_usage()?);
+        }
+
         let field_type = self.parse_type()?;
 
         let name = match &self.current_token {
@@ -653,6 +985,7 @@ impl Parser {
             is_final: false,
             initializer,
             property_hooks,
+            annotations,
         })
     }
 
@@ -771,6 +1104,11 @@ impl Parser {
         is_default: bool,
         is_constructor: bool,
     ) -> CompileResult<ClassMethod> {
+        let mut annotations = Vec::new();
+        while self.current_token == Token::At {
+            annotations.push(self.parse_annotation_usage()?);
+        }
+
         let name = match &self.current_token {
             Token::Identifier(n) => n.clone(),
             _ => {
@@ -821,6 +1159,7 @@ impl Parser {
             is_internal,
             is_abstract,
             is_default,
+            annotations,
         })
     }
 
@@ -867,7 +1206,454 @@ impl Parser {
             is_internal,
             is_abstract: true,
             is_default: false,
+            annotations: Vec::new(),
         })
+    }
+
+fn parse_annotation(&mut self) -> CompileResult<AnnotationDefinition> {
+        self.expect(Token::Annotation)?;
+
+        let name = match &self.current_token {
+            Token::Identifier(n) => n.clone(),
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected annotation name".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        let attribute = if self.current_token == Token::At {
+            self.parse_attribute_meta()?
+        } else {
+            Some(AttributeMeta {
+                targets: HashSet::new(),
+                retention: AnnotationRetention::Runtime,
+            })
+        };
+
+        self.expect(Token::LBrace)?;
+
+        let mut properties = Vec::new();
+        while self.current_token != Token::RBrace {
+            let prop = self.parse_annotation_property()?;
+            properties.push(prop);
+        }
+
+        self.expect(Token::RBrace)?;
+
+Ok(AnnotationDefinition {
+            name: name.clone(),
+            full_name: name,
+            attribute,
+            properties,
+            is_public: true,
+        })
+    }
+
+    fn parse_annotation_public(&mut self) -> CompileResult<AnnotationDefinition> {
+        let name = match &self.current_token {
+            Token::Identifier(n) => n.clone(),
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected annotation name".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        let attribute = if self.current_token == Token::At {
+            self.parse_attribute_meta()?
+        } else {
+            Some(AttributeMeta {
+                targets: HashSet::new(),
+                retention: AnnotationRetention::Runtime,
+            })
+        };
+
+        self.expect(Token::LBrace)?;
+
+        let mut properties = Vec::new();
+        while self.current_token != Token::RBrace {
+            let prop = self.parse_annotation_property()?;
+            properties.push(prop);
+        }
+
+        self.expect(Token::RBrace)?;
+
+        Ok(AnnotationDefinition {
+            name: name.clone(),
+            full_name: name,
+            attribute,
+            properties,
+            is_public: true,
+        })
+    }
+
+    fn parse_attribute_meta(&mut self) -> CompileResult<Option<AttributeMeta>> {
+        self.expect(Token::At)?;
+
+        let attr_name = match &self.current_token {
+            Token::Identifier(n) if n == "Attribute" => n.clone(),
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected 'Attribute' meta-annotation".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        self.expect(Token::LParen)?;
+
+        let mut targets = HashSet::new();
+        let mut retention = AnnotationRetention::Runtime;
+
+        while self.current_token != Token::RParen {
+            match &self.current_token {
+                Token::Identifier(n) if n == "target" => {
+                    self.bump();
+                    self.expect(Token::Colon)?;
+                    targets = self.parse_target_flags()?;
+                }
+                Token::Identifier(n) if n == "retention" => {
+                    self.bump();
+                    self.expect(Token::Colon)?;
+                    retention = self.parse_retention_flag()?;
+                }
+                _ => {
+                    return Err(CompileError::ParserError(format!(
+                        "Unknown Attribute parameter: {:?}",
+                        self.current_token
+                    )))
+                }
+            }
+
+            if self.current_token == Token::Comma {
+                self.bump();
+            }
+        }
+
+        self.expect(Token::RParen)?;
+
+        Ok(Some(AttributeMeta { targets, retention }))
+    }
+
+    fn parse_target_flags(&mut self) -> CompileResult<HashSet<AnnotationTarget>> {
+        let mut targets = HashSet::new();
+
+        loop {
+            let target = match &self.current_token {
+                Token::Identifier(n) => match n.as_str() {
+                    "TARGET_CLASS" => AnnotationTarget::Class,
+                    "TARGET_FIELD" => AnnotationTarget::Field,
+                    "TARGET_METHOD" => AnnotationTarget::Method,
+                    "TARGET_PARAMETER" => AnnotationTarget::Parameter,
+                    "TARGET_CONSTRUCTOR" => AnnotationTarget::Constructor,
+                    "TARGET_PROPERTY" => AnnotationTarget::Property,
+                    "Attribute" => {
+                        self.bump();
+                        if self.current_token == Token::Dot {
+                            self.bump();
+                        }
+                        continue;
+                    }
+                    _ => {
+                        return Err(CompileError::ParserError(format!(
+                            "Unknown target flag: {}",
+                            n
+                        )))
+                    }
+                },
+                _ => break,
+            };
+            targets.insert(target);
+            self.bump();
+
+            if self.current_token == Token::Dot {
+                self.bump();
+            } else if self.current_token == Token::Pipe {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+
+        Ok(targets)
+    }
+
+    fn parse_retention_flag(&mut self) -> CompileResult<AnnotationRetention> {
+        let retention = match &self.current_token {
+            Token::Identifier(n) => match n.as_str() {
+                "RETENTION_SOURCE" => AnnotationRetention::Source,
+                "RETENTION_CLASS" => AnnotationRetention::Class,
+                "RETENTION_RUNTIME" => AnnotationRetention::Runtime,
+                "Attribute" => {
+                    self.bump();
+                    if self.current_token == Token::Dot {
+                        self.bump();
+                    }
+                    return self.parse_retention_flag();
+                }
+                _ => {
+                    return Err(CompileError::ParserError(format!(
+                        "Unknown retention flag: {}",
+                        n
+                    )))
+                }
+            },
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected retention flag".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        Ok(retention)
+    }
+
+    fn parse_annotation_property(&mut self) -> CompileResult<AnnotationProperty> {
+        let is_public = if self.current_token == Token::Public {
+            self.bump();
+            true
+        } else {
+            true
+        };
+
+        let property_type = self.parse_type()?;
+
+        let name = match &self.current_token {
+            Token::Variable(n) => {
+                let raw_name = n.clone();
+                let is_value_param = raw_name == "$value";
+                let clean_name = if is_value_param {
+                    "value".to_string()
+                } else {
+                    raw_name.trim_start_matches('$').to_string()
+                };
+                self.bump();
+                (clean_name, is_value_param)
+            }
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected property name (must start with $)".to_string(),
+                ))
+            }
+        };
+
+        let default_value = if self.current_token == Token::Equal {
+            return Err(CompileError::ParserError(
+                "Pava annotation property defaults must use ':' instead of '='. Use: `$name: defaultValue`".to_string()
+            ));
+        } else if self.current_token == Token::Colon {
+            self.bump();
+            Some(self.parse_annotation_value()?)
+        } else {
+            None
+        };
+
+        if self.current_token == Token::Semicolon {
+            self.bump();
+        }
+
+        Ok(AnnotationProperty {
+            name: name.0,
+            property_type,
+            default_value,
+            is_value_param: name.1,
+        })
+    }
+
+    fn parse_annotation_value(&mut self) -> CompileResult<AnnotationValue> {
+        match &self.current_token {
+            Token::IntLiteral(n) => {
+                let val = *n;
+                self.bump();
+                Ok(AnnotationValue::Int(val))
+            }
+            Token::FloatLiteral(n) => {
+                let val = *n;
+                self.bump();
+                Ok(AnnotationValue::Float(val))
+            }
+            Token::StringLiteral(s) => {
+                let val = s.clone();
+                self.bump();
+                Ok(AnnotationValue::String(val))
+            }
+            Token::True => {
+                self.bump();
+                Ok(AnnotationValue::Bool(true))
+            }
+            Token::False => {
+                self.bump();
+                Ok(AnnotationValue::Bool(false))
+            }
+            Token::Null => {
+                self.bump();
+                Ok(AnnotationValue::Null)
+            }
+            Token::LBracket => {
+                self.bump();
+                let mut values = Vec::new();
+                while self.current_token != Token::RBracket {
+                    values.push(self.parse_annotation_value()?);
+                    if self.current_token == Token::Comma {
+                        self.bump();
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                Ok(AnnotationValue::Array(values))
+            }
+            Token::Identifier(n) if n == "class" => {
+                self.bump();
+                let class_name = match &self.current_token {
+                    Token::Identifier(name) => name.clone(),
+                    _ => {
+                        return Err(CompileError::ParserError(
+                            "Expected class name after 'class'".to_string(),
+                        ))
+                    }
+                };
+                self.bump();
+                Ok(AnnotationValue::ClassRef(class_name))
+            }
+            Token::Identifier(class_name) => {
+                let class_name_str = class_name.clone();
+                self.bump();
+                if self.current_token == Token::Dot {
+                    self.bump();
+                    let enum_value = match &self.current_token {
+                        Token::Identifier(v) => v.clone(),
+                        _ => {
+                            return Err(CompileError::ParserError(
+                                "Expected enum value name".to_string(),
+                            ))
+                        }
+                    };
+                    self.bump();
+                    
+                    if self.current_token == Token::Pipe {
+                        let mut values = vec![AnnotationValue::EnumRef(class_name_str.clone(), enum_value.clone())];
+                        self.bump();
+                        
+                        loop {
+                            let next_class = match &self.current_token {
+                                Token::Identifier(c) => c.clone(),
+                                _ => break,
+                            };
+                            self.bump();
+                            
+                            if self.current_token == Token::Dot {
+                                self.bump();
+                            }
+                            
+                            let next_enum = match &self.current_token {
+                                Token::Identifier(v) => v.clone(),
+                                _ => {
+                                    return Err(CompileError::ParserError(
+                                        "Expected enum value after '|'".to_string(),
+                                    ))
+                                }
+                            };
+                            self.bump();
+                            values.push(AnnotationValue::EnumRef(next_class, next_enum));
+                            
+                            if self.current_token == Token::Pipe {
+                                self.bump();
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        Ok(AnnotationValue::Array(values))
+                    } else {
+                        Ok(AnnotationValue::EnumRef(class_name_str, enum_value))
+                    }
+                } else {
+                    Ok(AnnotationValue::ClassRef(class_name_str))
+                }
+            }
+            _ => Err(CompileError::ParserError(format!(
+                "Unexpected token in annotation value: {:?}",
+                self.current_token
+            ))),
+        }
+    }
+
+    fn parse_annotation_usage(&mut self) -> CompileResult<AnnotationUsage> {
+        self.expect(Token::At)?;
+
+        let name = match &self.current_token {
+            Token::Identifier(n) => n.clone(),
+            _ => {
+                return Err(CompileError::ParserError(
+                    "Expected annotation name after '@'".to_string(),
+                ))
+            }
+        };
+        self.bump();
+
+        let arguments = if self.current_token == Token::LParen {
+            self.bump();
+            let args = self.parse_annotation_arguments()?;
+            self.expect(Token::RParen)?;
+            args
+        } else {
+            Vec::new()
+        };
+
+        Ok(AnnotationUsage { name, arguments })
+    }
+
+    fn parse_annotation_arguments(&mut self) -> CompileResult<Vec<AnnotationArgument>> {
+        let mut arguments = Vec::new();
+
+        if self.current_token == Token::RParen {
+            return Ok(arguments);
+        }
+
+        while self.current_token != Token::RParen {
+            if matches!(self.current_token, Token::Equal | Token::LBrace) {
+                return Err(CompileError::ParserError(
+                    "Pava annotation arguments must use ':' for key-value pairs and '[]' for arrays, not '=' and '{}'. Example: @Column(\"id\", nullable: false) or @Names([\"a\", \"b\"])".to_string()
+                ));
+            }
+
+            let (key, value) = self.parse_annotation_argument()?;
+            arguments.push(AnnotationArgument { key, value });
+
+            if self.current_token == Token::Comma {
+                self.bump();
+            }
+        }
+
+        Ok(arguments)
+    }
+
+    fn parse_annotation_argument(&mut self) -> CompileResult<(Option<String>, AnnotationValue)> {
+        if matches!(self.current_token, Token::Identifier(_)) {
+            let potential_key = match &self.current_token {
+                Token::Identifier(n) => n.clone(),
+                _ => unreachable!(),
+            };
+            self.bump();
+
+            if self.current_token == Token::Colon {
+                self.bump();
+                let value = self.parse_annotation_value()?;
+                return Ok((Some(potential_key), value));
+            } else if self.current_token == Token::Equal {
+                return Err(CompileError::ParserError(
+                    "Pava annotation arguments must use ':' instead of '='. Example: @Column(name: \"id\")".to_string()
+                ));
+            } else {
+                return Ok((None, AnnotationValue::String(potential_key)));
+            }
+        }
+
+        let value = self.parse_annotation_value()?;
+        Ok((None, value))
     }
 
     fn parse_params(&mut self) -> CompileResult<Vec<(String, Type)>> {

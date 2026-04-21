@@ -49,6 +49,7 @@ pub enum Token {
     Finally,
     Get,
     Set,
+    Annotation,
 
     // Types
     Type(String),
@@ -472,6 +473,7 @@ impl Lexer {
             "finally" => Token::Finally,
             "get" => Token::Get,
             "set" => Token::Set,
+            "annotation" => Token::Annotation,
             "instanceof" => Token::Instanceof,
             "string" | "String" => Token::Type(String::from("string")),
             "boolean" | "bool" => Token::TypeBoolean,

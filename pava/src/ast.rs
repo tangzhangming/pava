@@ -1,3 +1,119 @@
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnnotationTarget {
+    Class,
+    Field,
+    Method,
+    Parameter,
+    Constructor,
+    Property,
+}
+
+impl AnnotationTarget {
+    pub fn to_element_type(&self) -> &'static str {
+        match self {
+            AnnotationTarget::Class => "TYPE",
+            AnnotationTarget::Field => "FIELD",
+            AnnotationTarget::Method => "METHOD",
+            AnnotationTarget::Parameter => "PARAMETER",
+            AnnotationTarget::Constructor => "CONSTRUCTOR",
+            AnnotationTarget::Property => "FIELD",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnnotationRetention {
+    Source,
+    Class,
+    Runtime,
+}
+
+impl AnnotationRetention {
+    pub fn to_retention_policy(&self) -> &'static str {
+        match self {
+            AnnotationRetention::Source => "SOURCE",
+            AnnotationRetention::Class => "CLASS",
+            AnnotationRetention::Runtime => "RUNTIME",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeMeta {
+    pub targets: HashSet<AnnotationTarget>,
+    pub retention: AnnotationRetention,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotationProperty {
+    pub name: String,
+    pub property_type: Type,
+    pub default_value: Option<AnnotationValue>,
+    pub is_value_param: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AnnotationValue {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+    Array(Vec<AnnotationValue>),
+    ClassRef(String),
+    EnumRef(String, String),
+    Annotation(AnnotationUsage),
+    Null,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotationDefinition {
+    pub name: String,
+    pub full_name: String,
+    pub attribute: Option<AttributeMeta>,
+    pub properties: Vec<AnnotationProperty>,
+    pub is_public: bool,
+}
+
+impl AnnotationDefinition {
+    pub fn with_package(&self, package: &Option<String>) -> Self {
+        let mut new_def = self.clone();
+        new_def.full_name = match package {
+            Some(pkg) => format!("{}/{}", pkg, self.name),
+            None => self.name.clone(),
+        };
+        new_def
+    }
+}
+
+impl Default for AnnotationDefinition {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            full_name: String::new(),
+            attribute: Some(AttributeMeta {
+                targets: HashSet::new(),
+                retention: AnnotationRetention::Runtime,
+            }),
+            properties: Vec::new(),
+            is_public: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotationUsage {
+    pub name: String,
+    pub arguments: Vec<AnnotationArgument>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotationArgument {
+    pub key: Option<String>,
+    pub value: AnnotationValue,
+}
+
 impl Expr {
     pub fn result_type(&self) -> Result<Type, String> {
         match self {
@@ -44,9 +160,10 @@ pub struct Import {
 
 #[derive(Debug, Clone)]
 pub struct CompilationUnit {
-    pub package: Option<String>, // 如 "com/example"
+    pub package: Option<String>,
     pub imports: Vec<Import>,
     pub classes: Vec<Class>,
+    pub annotations: Vec<AnnotationDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,10 +233,11 @@ pub struct ClassField {
     pub is_public: bool,
     pub is_private: bool,
     pub is_protected: bool,
-    pub is_internal: bool, // 模块内可见
+    pub is_internal: bool,
     pub is_final: bool,
     pub initializer: Option<Expr>,
     pub property_hooks: Vec<PropertyHook>,
+    pub annotations: Vec<AnnotationUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,9 +251,10 @@ pub struct ClassMethod {
     pub is_public: bool,
     pub is_private: bool,
     pub is_protected: bool,
-    pub is_internal: bool, // 模块内可见
+    pub is_internal: bool,
     pub is_abstract: bool,
     pub is_default: bool,
+    pub annotations: Vec<AnnotationUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +276,7 @@ pub struct ClassConst {
 #[derive(Debug, Clone)]
 pub struct Class {
     pub name: String,
-    pub full_name: String, // 包含包名的完整类名，如 "com/example/MyClass"
+    pub full_name: String,
     pub extends: Option<String>,
     pub implements: Vec<String>,
     pub is_abstract: bool,
@@ -171,6 +290,7 @@ pub struct Class {
     pub constants: Vec<ClassConst>,
     pub constructor: Option<ClassMethod>,
     pub enum_values: Vec<EnumValue>,
+    pub annotations: Vec<AnnotationUsage>,
 }
 
 impl Class {
@@ -202,6 +322,7 @@ impl Default for Class {
             constants: Vec::new(),
             constructor: None,
             enum_values: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 }

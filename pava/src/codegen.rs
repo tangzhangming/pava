@@ -90,6 +90,7 @@ enum ConstantPoolEntry {
     MethodRef(u16, u16),
     FieldRef(u16, u16),
     NameAndType(u16, u16),
+    Annotation(u16),
 }
 
 const ACC_PUBLIC: u16 = 0x0001;
@@ -162,18 +163,15 @@ impl CodeGen {
         for field in &class.fields {
             self.class_fields
                 .insert(field.name.clone(), field.field_type.clone());
-            // 预添加所有字段名和类型到常量池，以便在生成方法时引用
             self.add_utf8_constant(&field.name);
             self.add_utf8_constant(&field.field_type.to_jvm_descriptor());
         }
 
-        // 收集方法信息
         for method in &class.methods {
             self.class_methods
                 .insert(method.name.clone(), method.return_type.clone());
         }
         
-        // 收集属性挂钩生成的getter/setter方法信息
         for field in &class.fields {
             if !field.property_hooks.is_empty() {
                 self.property_hook_fields.insert(field.name.clone());
@@ -203,6 +201,183 @@ impl CodeGen {
         self.collect_constants_from_class(&class);
         self.init_constant_pool(&class);
         self.emit_class(&class)
+    }
+
+    pub fn generate_annotation(&mut self, annotation: crate::ast::AnnotationDefinition) -> CompileResult<Vec<u8>> {
+        self.class_name = annotation.full_name.clone();
+
+        self.init_constant_pool_for_annotation(&annotation);
+        self.emit_annotation(&annotation)
+    }
+
+    fn init_constant_pool_for_annotation(&mut self, annotation: &crate::ast::AnnotationDefinition) {
+        let mut add = |entry: ConstantPoolEntry| -> u16 {
+            let idx = self.constant_pool.len() as u16 + 1;
+            self.constant_pool.push(entry);
+            idx
+        };
+
+        let obj_utf8 = add(ConstantPoolEntry::Utf8("java/lang/Object".to_string()));
+        let obj_class = add(ConstantPoolEntry::Class(obj_utf8));
+        self.object_class_idx = obj_class;
+
+        let annotation_utf8 = add(ConstantPoolEntry::Utf8("java/lang/annotation/Annotation".to_string()));
+        add(ConstantPoolEntry::Class(annotation_utf8));
+
+        let retention_utf8 = add(ConstantPoolEntry::Utf8("java/lang/annotation/Retention".to_string()));
+        add(ConstantPoolEntry::Class(retention_utf8));
+
+        let target_utf8 = add(ConstantPoolEntry::Utf8("java/lang/annotation/Target".to_string()));
+        add(ConstantPoolEntry::Class(target_utf8));
+
+        let retention_policy_utf8 = add(ConstantPoolEntry::Utf8("java/lang/annotation/RetentionPolicy".to_string()));
+        add(ConstantPoolEntry::Class(retention_policy_utf8));
+
+        let element_type_utf8 = add(ConstantPoolEntry::Utf8("java/lang/annotation/ElementType".to_string()));
+        add(ConstantPoolEntry::Class(element_type_utf8));
+
+        let class_utf8 = add(ConstantPoolEntry::Utf8(annotation.full_name.clone()));
+        let class_class = add(ConstantPoolEntry::Class(class_utf8));
+        self.class_idx = class_class;
+
+        let runtime_vis_annotations_utf8 = add(ConstantPoolEntry::Utf8("RuntimeVisibleAnnotations".to_string()));
+        let retention_policy_utf8 = add(ConstantPoolEntry::Utf8("Ljava/lang/annotation/RetentionPolicy;".to_string()));
+        let value_name_utf8 = add(ConstantPoolEntry::Utf8("value".to_string()));
+        let _runtime_enum_ref = add(ConstantPoolEntry::NameAndType(value_name_utf8, retention_policy_utf8));
+
+        for prop in &annotation.properties {
+            self.add_utf8_constant(&prop.name);
+            self.add_utf8_constant(&prop.property_type.to_jvm_descriptor());
+        }
+    }
+
+    fn emit_annotation(&mut self, annotation: &crate::ast::AnnotationDefinition) -> CompileResult<Vec<u8>> {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x41]);
+
+        let annotation_attr_bytes = self.build_annotation_attributes(annotation);
+
+        let cp_count = self.constant_pool.iter().fold(1, |acc, entry| {
+            acc + match entry {
+                ConstantPoolEntry::Long(_) | ConstantPoolEntry::Double(_) => 2,
+                _ => 1,
+            }
+        }) as u16;
+        bytes.extend_from_slice(&cp_count.to_be_bytes());
+
+        for entry in &self.constant_pool {
+            self.emit_cp_entry(&mut bytes, entry);
+        }
+
+        let access_flags = ACC_PUBLIC | 0x2000;
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        bytes.extend_from_slice(&self.class_idx.to_be_bytes());
+        bytes.extend_from_slice(&self.object_class_idx.to_be_bytes());
+
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        let num_methods = annotation.properties.len() as u16;
+        bytes.extend_from_slice(&num_methods.to_be_bytes());
+
+        for prop in &annotation.properties {
+            self.emit_annotation_interface_method(&mut bytes, prop)?;
+        }
+
+        let attr_count: u16 = 1;
+        bytes.extend_from_slice(&attr_count.to_be_bytes());
+        bytes.extend_from_slice(&annotation_attr_bytes);
+
+        Ok(bytes)
+    }
+
+    fn build_annotation_attributes(&mut self, annotation: &crate::ast::AnnotationDefinition) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+        bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+
+        let mut annotation_content = Vec::new();
+        annotation_content.extend_from_slice(&1u16.to_be_bytes());
+
+        if let Some(ref attr) = annotation.attribute {
+            self.emit_meta_annotations(&mut annotation_content, attr);
+        }
+
+        let attr_len = annotation_content.len() as u32;
+        bytes.extend_from_slice(&attr_len.to_be_bytes());
+        bytes.extend_from_slice(&annotation_content);
+
+        bytes
+    }
+
+    fn emit_meta_annotations(&mut self, bytes: &mut Vec<u8>, attr: &crate::ast::AttributeMeta) {
+        let retention_type_idx = self.add_utf8_constant("Ljava/lang/annotation/Retention;");
+        bytes.extend_from_slice(&retention_type_idx.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+
+        let value_name_idx = self.add_utf8_constant("value");
+        bytes.extend_from_slice(&value_name_idx.to_be_bytes());
+
+        bytes.push(0x65);
+        let retention_policy_type_idx = self.add_utf8_constant("Ljava/lang/annotation/RetentionPolicy;");
+        bytes.extend_from_slice(&retention_policy_type_idx.to_be_bytes());
+        let retention_value_idx = self.add_utf8_constant(attr.retention.to_retention_policy());
+        bytes.extend_from_slice(&retention_value_idx.to_be_bytes());
+
+        if !attr.targets.is_empty() {
+            let target_type_idx = self.add_utf8_constant("Ljava/lang/annotation/Target;");
+            bytes.extend_from_slice(&target_type_idx.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+
+            let value_name_idx = self.add_utf8_constant("value");
+            bytes.extend_from_slice(&value_name_idx.to_be_bytes());
+
+            bytes.push(0x5B);
+            let num_targets = attr.targets.len() as u16;
+            bytes.extend_from_slice(&num_targets.to_be_bytes());
+
+            for target in &attr.targets {
+                bytes.push(0x65);
+                let element_type_type_idx = self.add_utf8_constant("Ljava/lang/annotation/ElementType;");
+                bytes.extend_from_slice(&element_type_type_idx.to_be_bytes());
+                let target_value_idx = self.add_utf8_constant(target.to_element_type());
+                bytes.extend_from_slice(&target_value_idx.to_be_bytes());
+            }
+        }
+    }
+
+    fn emit_annotation_interface_method(&mut self, bytes: &mut Vec<u8>, prop: &crate::ast::AnnotationProperty) -> CompileResult<()> {
+        let access_flags = ACC_PUBLIC | ACC_ABSTRACT;
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&prop.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = format!("(){}", prop.property_type.to_jvm_descriptor());
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        if let Some(ref default_value) = prop.default_value {
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+
+            let annotation_default_idx = self.add_utf8_constant("AnnotationDefault");
+            bytes.extend_from_slice(&annotation_default_idx.to_be_bytes());
+
+            let mut default_bytes = Vec::new();
+            self.emit_annotation_element_value(&mut default_bytes, default_value);
+
+            let attr_len = default_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&default_bytes);
+        } else {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        Ok(())
     }
 
     fn collect_constants_from_class(&mut self, class: &Class) {
@@ -451,14 +626,11 @@ impl CodeGen {
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
-        // Java 21 = major version 65 = 0x0041
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x41]);
 
-        // 先收集所有方法，这可能会添加更多常量到常量池
         let mut method_bytes = Vec::new();
         let has_clinit = !class.constants.is_empty() || class.is_enum;
 
-        // 生成构造函数
         if class.is_enum {
             self.emit_enum_init_method(&mut method_bytes, class)?;
         } else if class.constructor.is_some() {
@@ -467,12 +639,10 @@ impl CodeGen {
             self.emit_init_method(&mut method_bytes, class)?;
         }
 
-        // 生成 clinit 方法
         if has_clinit {
             self.emit_clinit_method(&mut method_bytes, class)?;
         }
 
-        // 生成其他方法（这可能会添加常量到常量池）
         for method in &class.methods {
             if method.name == "main" {
                 self.emit_main_method(&mut method_bytes, class)?;
@@ -483,14 +653,12 @@ impl CodeGen {
             }
         }
 
-        // 为具有属性挂钩的字段生成getter/setter方法（在常量池输出之前）
         for field in &class.fields {
             if !field.property_hooks.is_empty() {
                 self.emit_property_methods(&mut method_bytes, field)?;
             }
         }
 
-        // 现在常量池已经完整，计算并输出
         let cp_count = self.constant_pool.iter().fold(1, |acc, entry| {
             acc + match entry {
                 ConstantPoolEntry::Long(_) | ConstantPoolEntry::Double(_) => 2,
@@ -548,10 +716,8 @@ impl CodeGen {
 
         for field in &class.fields {
             if field.property_hooks.is_empty() {
-                // 普通字段，生成 public 字段
                 self.emit_field(&mut bytes, field);
             } else {
-                // 有 property hooks，生成私有 backing field
                 self.emit_property_backing_field(&mut bytes, field);
             }
         }
@@ -562,8 +728,6 @@ impl CodeGen {
             }
         }
 
-        // 计算属性挂钩方法数量
-        // Each hook generates one method, plus we may generate a default getter for fields with only setter
         let property_methods_count: usize = class.fields.iter()
             .map(|f| {
                 let has_getter = f.property_hooks.iter().any(|h| h.hook_type == PropertyHookType::Get);
@@ -574,15 +738,24 @@ impl CodeGen {
             .sum();
         
         let method_count = class.methods.len() as u16 
-            + 1  // <init>
+            + 1
             + if has_clinit { 1 } else { 0 }
             + property_methods_count as u16;
         bytes.extend_from_slice(&method_count.to_be_bytes());
 
-        // 添加所有方法字节
         bytes.extend_from_slice(&method_bytes);
 
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        if !class.annotations.is_empty() {
+            let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+            let annotations_bytes = self.build_runtime_visible_annotations(&class.annotations);
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+            let attr_len = annotations_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&annotations_bytes);
+        } else {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
 
         Ok(bytes)
     }
@@ -634,7 +807,178 @@ impl CodeGen {
         let desc_idx = self.add_utf8_constant(&descriptor);
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
 
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        if !field.annotations.is_empty() {
+            let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+            let annotations_bytes = self.build_runtime_visible_annotations(&field.annotations);
+            let attr_count: u16 = 1;
+            bytes.extend_from_slice(&attr_count.to_be_bytes());
+            bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+            let attr_len = annotations_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&annotations_bytes);
+        } else {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+
+    fn build_runtime_visible_annotations(&mut self, annotations: &[crate::ast::AnnotationUsage]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let num_annotations = annotations.len() as u16;
+        bytes.extend_from_slice(&num_annotations.to_be_bytes());
+
+        for annotation in annotations {
+            self.emit_annotation_structure(&mut bytes, annotation);
+        }
+
+        bytes
+    }
+
+    fn emit_annotation_structure(&mut self, bytes: &mut Vec<u8>, annotation: &crate::ast::AnnotationUsage) {
+        let annotation_descriptor = format!("L{};", annotation.name.replace('.', "/"));
+        let type_idx = self.add_utf8_constant(&annotation_descriptor);
+        bytes.extend_from_slice(&type_idx.to_be_bytes());
+
+        let num_element_value_pairs = annotation.arguments.len() as u16;
+        bytes.extend_from_slice(&num_element_value_pairs.to_be_bytes());
+
+        for arg in &annotation.arguments {
+            if let Some(ref key) = arg.key {
+                let element_name_idx = self.add_utf8_constant(key);
+                bytes.extend_from_slice(&element_name_idx.to_be_bytes());
+            } else {
+                let value_name_idx = self.add_utf8_constant("value");
+                bytes.extend_from_slice(&value_name_idx.to_be_bytes());
+            }
+            self.emit_annotation_element_value(bytes, &arg.value);
+        }
+    }
+
+    fn emit_annotation_element_value(&mut self, bytes: &mut Vec<u8>, value: &crate::ast::AnnotationValue) {
+        match value {
+            crate::ast::AnnotationValue::Int(n) => {
+                bytes.push(0x03); // 'I' for primitive int
+                if let Some(&idx) = self.integer_constants.get(&(*n as i32)) {
+                    let const_idx = self.add_integer_constant(*n as i32);
+                    bytes.extend_from_slice(&const_idx.to_be_bytes());
+                } else {
+                    let const_idx = self.add_integer_constant(*n as i32);
+                    bytes.extend_from_slice(&const_idx.to_be_bytes());
+                }
+            }
+            crate::ast::AnnotationValue::Float(f) => {
+                bytes.push(0x04); // 'F' for primitive float
+                let f32_val = *f as f32;
+                let const_idx = self.add_float_constant(f32_val);
+                bytes.extend_from_slice(&const_idx.to_be_bytes());
+            }
+            crate::ast::AnnotationValue::String(s) => {
+                bytes.push(0x73); // 's' for String
+                let utf8_idx = self.add_utf8_constant(s);
+                let string_idx = self.add_string_constant(utf8_idx);
+                bytes.extend_from_slice(&string_idx.to_be_bytes());
+            }
+            crate::ast::AnnotationValue::Bool(b) => {
+                bytes.push(0x03); // 'Z' for boolean (stored as int)
+                let const_idx = if *b { self.add_integer_constant(1) } else { self.add_integer_constant(0) };
+                bytes.extend_from_slice(&const_idx.to_be_bytes());
+            }
+            crate::ast::AnnotationValue::Array(values) => {
+                bytes.push(0x5B); // '[' for array
+                let num_values = values.len() as u16;
+                bytes.extend_from_slice(&num_values.to_be_bytes());
+                for v in values {
+                    self.emit_annotation_element_value(bytes, v);
+                }
+            }
+            crate::ast::AnnotationValue::ClassRef(class_name) => {
+                bytes.push(0x63); // 'c' for class
+                let class_descriptor = format!("L{};", class_name.replace('.', "/"));
+                let class_utf8_idx = self.add_utf8_constant(&class_descriptor);
+                let class_idx = self.add_class_constant(&class_name.replace('.', "/"));
+                bytes.extend_from_slice(&class_idx.to_be_bytes());
+            }
+            crate::ast::AnnotationValue::EnumRef(enum_class, enum_value) => {
+                bytes.push(0x65); // 'e' for enum
+                let enum_descriptor = format!("L{};", enum_class.replace('.', "/"));
+                let type_name_idx = self.add_utf8_constant(&enum_descriptor);
+                let const_name_idx = self.add_utf8_constant(enum_value);
+                bytes.extend_from_slice(&type_name_idx.to_be_bytes());
+                bytes.extend_from_slice(&const_name_idx.to_be_bytes());
+            }
+            crate::ast::AnnotationValue::Annotation(inner_annotation) => {
+                bytes.push(0x40); // '@' for nested annotation
+                self.emit_annotation_structure(bytes, inner_annotation);
+            }
+            crate::ast::AnnotationValue::Null => {
+                bytes.push(0x73); // 's' for String (null as empty string workaround)
+                let utf8_idx = self.add_utf8_constant("");
+                let string_idx = self.add_string_constant(utf8_idx);
+                bytes.extend_from_slice(&string_idx.to_be_bytes());
+            }
+        }
+    }
+
+    fn emit_annotation_definition(&mut self, bytes: &mut Vec<u8>, annotation: &crate::ast::AnnotationDefinition) -> CompileResult<Vec<u8>> {
+        let mut annotation_bytes = Vec::new();
+
+        let access_flags = if annotation.is_public { ACC_PUBLIC } else { 0 } | 0x2000;
+        annotation_bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&annotation.name);
+        annotation_bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let interface_descriptor = self.add_utf8_constant(&annotation.full_name);
+        annotation_bytes.extend_from_slice(&interface_descriptor.to_be_bytes());
+
+        let super_class_idx = self.object_class_idx;
+        annotation_bytes.extend_from_slice(&super_class_idx.to_be_bytes());
+
+        annotation_bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        annotation_bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        let num_methods = annotation.properties.len() as u16;
+        annotation_bytes.extend_from_slice(&num_methods.to_be_bytes());
+
+        for prop in &annotation.properties {
+            self.emit_annotation_method(&mut annotation_bytes, prop)?;
+        }
+
+        annotation_bytes.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(annotation_bytes)
+    }
+
+    fn emit_annotation_method(&mut self, bytes: &mut Vec<u8>, prop: &crate::ast::AnnotationProperty) -> CompileResult<()> {
+        let access_flags = ACC_PUBLIC | ACC_ABSTRACT;
+        bytes.extend_from_slice(&access_flags.to_be_bytes());
+
+        let name_idx = self.add_utf8_constant(&prop.name);
+        bytes.extend_from_slice(&name_idx.to_be_bytes());
+
+        let descriptor = format!("(){}", prop.property_type.to_jvm_descriptor());
+        let desc_idx = self.add_utf8_constant(&descriptor);
+        bytes.extend_from_slice(&desc_idx.to_be_bytes());
+
+        if let Some(ref default_value) = prop.default_value {
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            let annotation_default_idx = self.add_utf8_constant("AnnotationDefault");
+            bytes.extend_from_slice(&annotation_default_idx.to_be_bytes());
+            let default_bytes = self.build_annotation_default(default_value);
+            let attr_len = default_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&default_bytes);
+        } else {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        Ok(())
+    }
+
+    fn build_annotation_default(&mut self, value: &crate::ast::AnnotationValue) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.emit_annotation_element_value(&mut bytes, value);
+        bytes
     }
 
     fn emit_enum_field(&mut self, bytes: &mut Vec<u8>, class_name: &str, enum_val: &EnumValue) {
@@ -815,9 +1159,22 @@ impl CodeGen {
             return Ok(());
         }
 
-        bytes.extend_from_slice(&1u16.to_be_bytes());
+        let has_annotations = !method.annotations.is_empty();
+        let attr_count: u16 = if has_annotations { 2 } else { 1 };
+
+        bytes.extend_from_slice(&attr_count.to_be_bytes());
 
         self.emit_method_code(bytes, method)?;
+
+        if has_annotations {
+            let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+            let annotations_bytes = self.build_runtime_visible_annotations(&method.annotations);
+            bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+            let attr_len = annotations_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&annotations_bytes);
+        }
+
         Ok(())
     }
 
@@ -1016,6 +1373,10 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
                 bytes.push(0x0C);
                 bytes.extend_from_slice(&n.to_be_bytes());
                 bytes.extend_from_slice(&t.to_be_bytes());
+            }
+            ConstantPoolEntry::Annotation(idx) => {
+                bytes.push(0x07);
+                bytes.extend_from_slice(&idx.to_be_bytes());
             }
         }
     }
@@ -1263,7 +1624,7 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         Ok(())
     }
 
-    fn emit_getter(
+fn emit_getter(
         &mut self,
         bytes: &mut Vec<u8>,
         field: &ClassField,
@@ -1280,74 +1641,71 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&access_flags.to_be_bytes());
         bytes.extend_from_slice(&name_idx.to_be_bytes());
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
 
-        // Set flag to indicate we're inside a property hook method
+        let has_annotations = !field.annotations.is_empty();
+        let attr_count: u16 = if has_annotations { 2 } else { 1 };
+        bytes.extend_from_slice(&attr_count.to_be_bytes());
+
         self.in_property_hook = true;
         self.current_property_field = Some(field.name.clone());
 
         self.code_buffer.clear();
         self.local_vars.clear();
-        self.max_stack = 4; // getter needs stack for string concat (StringBuilder + 2 strings)
+        self.max_stack = 4;
         self.max_locals = 1;
         self.local_vars.insert("this".to_string(), (0, VarType::Ref));
 
         if hook.body.is_empty() {
-            // Auto-generated getter: return this.field;
-            self.code_buffer.push(0x2A); // aload_0
+            self.code_buffer.push(0x2A);
             let field_descriptor = field.field_type.to_jvm_descriptor();
             let field_idx = self.add_fieldref_constant(&self.class_name.clone(), &field.name, &field_descriptor);
-            self.code_buffer.push(0xB4); // getfield
+            self.code_buffer.push(0xB4);
             self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
             
-            // Return based on type
             match field.field_type {
                 Type::Int8 | Type::Int16 | Type::Int32 | Type::Boolean => {
-                    self.code_buffer.push(0xAC); // ireturn
+                    self.code_buffer.push(0xAC);
                 }
                 Type::Int64 => {
-                    self.code_buffer.push(0xAD); // lreturn
+                    self.code_buffer.push(0xAD);
                 }
                 Type::Float32 => {
-                    self.code_buffer.push(0xAE); // freturn
+                    self.code_buffer.push(0xAE);
                 }
                 Type::Float64 => {
-                    self.code_buffer.push(0xAF); // dreturn
+                    self.code_buffer.push(0xAF);
                 }
                 _ => {
-                    self.code_buffer.push(0xB0); // areturn
+                    self.code_buffer.push(0xB0);
                 }
             }
         } else {
-            // Custom getter body
             for stmt in &hook.body {
                 self.emit_stmt(stmt)?;
             }
             
-            // Ensure return
             if self.code_buffer.is_empty() || self.code_buffer.last() != Some(&0xB1) {
                 if !hook.body.iter().any(|s| matches!(s, Stmt::Return(_))) {
-                    // Return default value based on type
                     match field.field_type {
                         Type::Int8 | Type::Int16 | Type::Int32 | Type::Boolean => {
-                            self.code_buffer.push(0x03); // iconst_0
-                            self.code_buffer.push(0xAC); // ireturn
+                            self.code_buffer.push(0x03);
+                            self.code_buffer.push(0xAC);
                         }
                         Type::Int64 => {
-                            self.code_buffer.push(0x09); // lconst_0
-                            self.code_buffer.push(0xAD); // lreturn
+                            self.code_buffer.push(0x09);
+                            self.code_buffer.push(0xAD);
                         }
                         Type::Float32 => {
-                            self.code_buffer.push(0x0B); // fconst_0
-                            self.code_buffer.push(0xAE); // freturn
+                            self.code_buffer.push(0x0B);
+                            self.code_buffer.push(0xAE);
                         }
                         Type::Float64 => {
-                            self.code_buffer.push(0x0E); // dconst_0
-                            self.code_buffer.push(0xAF); // dreturn
+                            self.code_buffer.push(0x0E);
+                            self.code_buffer.push(0xAF);
                         }
                         _ => {
-                            self.code_buffer.push(0x01); // aconst_null
-                            self.code_buffer.push(0xB0); // areturn
+                            self.code_buffer.push(0x01);
+                            self.code_buffer.push(0xB0);
                         }
                     }
                 }
@@ -1364,11 +1722,19 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&code_len.to_be_bytes());
         bytes.extend_from_slice(&self.code_buffer);
 
-        bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
-        bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
 
-        // Clear the flag after generating the property hook method
-        self.in_property_hook = false;
+        if has_annotations {
+            let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+            let annotations_bytes = self.build_runtime_visible_annotations(&field.annotations);
+            bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+            let attr_len = annotations_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&annotations_bytes);
+        }
+
+self.in_property_hook = false;
         self.current_property_field = None;
 
         Ok(())
@@ -1383,7 +1749,6 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
     ) -> CompileResult<()> {
         let method_name = format!("set{}", capitalize(&field.name));
         
-        // Use hook's param_type if specified, otherwise use field's type
         let setter_param_type = hook.param_type.as_ref().unwrap_or(&field.field_type);
         let descriptor = format!("({})V", setter_param_type.to_jvm_descriptor());
 
@@ -1394,22 +1759,22 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&access_flags.to_be_bytes());
         bytes.extend_from_slice(&name_idx.to_be_bytes());
         bytes.extend_from_slice(&desc_idx.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
 
-        // Set flag to indicate we're inside a property hook method
+        let has_annotations = !field.annotations.is_empty();
+        let attr_count: u16 = if has_annotations { 2 } else { 1 };
+        bytes.extend_from_slice(&attr_count.to_be_bytes());
+
         self.in_property_hook = true;
         self.current_property_field = Some(field.name.clone());
 
         self.code_buffer.clear();
         self.local_vars.clear();
-        self.max_stack = 6; // setter needs stack for string concat (StringBuilder + multiple strings)
+        self.max_stack = 6;
         self.max_locals = 1;
         self.local_vars.insert("this".to_string(), (0, VarType::Ref));
         
-        // Use hook's param_name if specified, otherwise use "value"
         let param_name = hook.param_name.as_deref().unwrap_or("value");
         
-        // Add value parameter with the correct type
         let value_type = self.type_to_var_type(setter_param_type);
         let value_slots = match value_type {
             VarType::Long | VarType::Double => 2,
@@ -1419,24 +1784,21 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         self.max_locals = 1 + value_slots;
 
         if hook.body.is_empty() {
-            // Auto-generated setter: this.field = value;
-            self.code_buffer.push(0x2A); // aload_0
+            self.code_buffer.push(0x2A);
             self.emit_load_var(param_name)?;
             let field_descriptor = field.field_type.to_jvm_descriptor();
             let field_idx = self.add_fieldref_constant(&self.class_name.clone(), &field.name, &field_descriptor);
-            self.code_buffer.push(0xB5); // putfield
+            self.code_buffer.push(0xB5);
             self.code_buffer.extend_from_slice(&field_idx.to_be_bytes());
-            self.code_buffer.push(0xB1); // return
+            self.code_buffer.push(0xB1);
         } else {
-            // Custom setter body
             for stmt in &hook.body {
                 self.emit_stmt(stmt)?;
             }
             
-            // Ensure return
             if self.code_buffer.is_empty() || self.code_buffer.last() != Some(&0xB1) {
                 if !hook.body.iter().any(|s| matches!(s, Stmt::Return(_))) {
-                    self.code_buffer.push(0xB1); // return
+                    self.code_buffer.push(0xB1);
                 }
             }
         }
@@ -1451,14 +1813,22 @@ self.emit_method_code_bytes(bytes, initial_locals)?;
         bytes.extend_from_slice(&code_len.to_be_bytes());
         bytes.extend_from_slice(&self.code_buffer);
 
-        bytes.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
-        bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
 
-        // Clear the flag after generating the property hook method
+        if has_annotations {
+            let runtime_vis_annotations_idx = self.add_utf8_constant("RuntimeVisibleAnnotations");
+            let annotations_bytes = self.build_runtime_visible_annotations(&field.annotations);
+            bytes.extend_from_slice(&runtime_vis_annotations_idx.to_be_bytes());
+            let attr_len = annotations_bytes.len() as u32;
+            bytes.extend_from_slice(&attr_len.to_be_bytes());
+            bytes.extend_from_slice(&annotations_bytes);
+        }
+
         self.in_property_hook = false;
         self.current_property_field = None;
 
-        Ok(())
+Ok(())
     }
 
     fn emit_main_method(&mut self, bytes: &mut Vec<u8>, class: &Class) -> CompileResult<()> {
@@ -3650,23 +4020,28 @@ pub fn compile(source: &str) -> CompileResult<Vec<u8>> {
 
 /// 编译编译单元（支持 package 和 imports）
 pub fn compile_unit(unit: &CompilationUnit) -> CompileResult<Vec<(String, Vec<u8>)>> {
-    let mut results = Vec::new();
+        let mut results = Vec::new();
 
-    for class in &unit.classes {
-        let mut codegen = CodeGen::new(class.clone());
-        // 存储 import 的类路径
-        codegen.imports = unit
-            .imports
-            .iter()
-            .filter(|imp| !imp.is_star)
-            .map(|imp| imp.path.clone())
-            .collect();
-        let bytecode = codegen.generate(class.clone())?;
-        results.push((class.full_name.clone(), bytecode));
+        for annotation in &unit.annotations {
+            let mut codegen = CodeGen::new(Class::default());
+            let bytecode = codegen.generate_annotation(annotation.clone())?;
+            results.push((annotation.full_name.clone(), bytecode));
+        }
+
+        for class in &unit.classes {
+            let mut codegen = CodeGen::new(class.clone());
+            codegen.imports = unit
+                .imports
+                .iter()
+                .filter(|imp| !imp.is_star)
+                .map(|imp| imp.path.clone())
+                .collect();
+            let bytecode = codegen.generate(class.clone())?;
+            results.push((class.full_name.clone(), bytecode));
+        }
+
+        Ok(results)
     }
-
-    Ok(results)
-}
 
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
